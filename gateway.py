@@ -14,6 +14,7 @@ OpenAI 兼容接口，按 model 名路由到三池，池内权重轮询，跨池
   python3 gateway.py sync-runtime       # 运行时同步（发 SIGHUP 重载）
   python3 gateway.py undo               # 运行时逆栈：撤销最后一条操作
   python3 gateway.py undo-list          # 运行时逆栈：查看所有操作
+  python3 gateway.py fiber              # 查看 fiber 树（通过 Admin API）
 
 API 端点:
   GET  /v1/models                → 模型目录（含池/provider/健康/用量）
@@ -24,9 +25,13 @@ API 端点:
   POST /admin/pools/{pool}/providers/{provider}/toggle  → 启停 provider
   GET  /admin/undo               → 运行时逆栈：撤销最后一条操作
   GET  /admin/undo-list          → 运行时逆栈：查看所有操作
-  POST /admin/mcp/toggle         → MCP 工具：Agent 调 toggle，走审批缓存
+  POST /admin/mcp/toggle         → MCP 工具：Agent 调 toggle，走审批缓存 + fiber
   GET  /admin/mcp/approvals      → 查看审批缓存
   GET  /admin/mcp/status         → MCP 总览：熔断+权重+审批（含错误率）
+  POST /admin/fiber/create       → 创建 Fiber 任务树节点
+  POST /admin/fiber/{id}/fail    → 失败 fiber：级联回滚子孙
+  POST /admin/fiber/{id}/commit  → 提交 fiber：合并 undo 到父节点
+  GET  /admin/fiber/tree         → 查看 fiber 森林
 """
 import datetime
 import json
@@ -51,10 +56,12 @@ QQ_TARGET = "1310893084"
 _config = {}                    # 当前配置
 _disabled_providers = set()     # 被自动或手动禁用的 provider
 _rate_limit_buckets = {}        # {provider_name: [t1, t2, ...]}
-_undo_stack = []                # 运行时逆栈：[(description, callable), ...]
+_undo_stack = []                # 全局运行时逆栈：人类操作
 _dynamic_weights = {}           # {provider_name: effective_weight} 由熔断线程更新
 _approval_cache = {}            # {(agent_id, action_hash): expiry_timestamp}
 _pending_approvals = {}         # {action_id: {action, params, agent_id}}
+_fibers = {}                    # {fiber_id: Fiber} — Agent 任务树
+_next_fiber_id = 0
 _lock = threading.Lock()
 
 # ── 配置加载 ──
@@ -205,8 +212,93 @@ def undo_pop():
         return False, f"撤销失败 ({desc}): {e}"
 
 def undo_clear(reason=""):
-    """清空逆栈（配置热加载时调用，因为新配置是新起点）。"""
+    """清空全局逆栈（配置热加载时调用，因为新配置是新起点）。"""
     _undo_stack.clear()
+
+# ── Fiber 树形上下文（Agent 任务级可逆） ──
+import dataclasses
+
+@dataclasses.dataclass
+class Fiber:
+    """任务光纤。每棵 fiber 树对应一个统筹 Agent 的任务。
+    - 子 fiber 失败时级联回滚祖先
+    - undo_log 是 fiber 本地逆栈，提交时合并到父 fiber 或全局栈
+    """
+    id: int
+    parent_id: int | None
+    agent_id: str
+    description: str
+    status: str = "active"       # active | committed | failed
+    undo_log: list = dataclasses.field(default_factory=list)  # [(desc, callable), ...]
+    children: list = dataclasses.field(default_factory=list)  # [fiber_id, ...]
+    created_at: float = dataclasses.field(default_factory=time.time)
+
+def fiber_create(agent_id, description, parent_id=None):
+    """创建新 fiber。返回 fiber_id。"""
+    global _next_fiber_id
+    with _lock:
+        _next_fiber_id += 1
+        fid = _next_fiber_id
+        f = Fiber(id=fid, parent_id=parent_id, agent_id=agent_id, description=description)
+        _fibers[fid] = f
+        if parent_id is not None and parent_id in _fibers:
+            _fibers[parent_id].children.append(fid)
+        return fid
+
+def fiber_register(fiber_id, description, revert_callable):
+    """向 fiber 注册撤销操作。若 fiber 已终止则拒绝。"""
+    f = _fibers.get(fiber_id)
+    if not f:
+        return False
+    if f.status != "active":
+        return False
+    f.undo_log.append((description, revert_callable))
+    return True
+
+def fiber_fail(fiber_id):
+    """失败 fiber：LIFO 回滚自己的 undo_log，然后递归失败所有子 fiber。
+    返回 (ok, 操作列表)。
+    """
+    f = _fibers.get(fiber_id)
+    if not f or f.status != "active":
+        return False, []
+    # 先递归失败子 fiber
+    for child_id in list(f.children):
+        fiber_fail(child_id)
+    # LIFO 回滚自己的 undo_log
+    ops = []
+    while f.undo_log:
+        desc, fn = f.undo_log.pop()
+        try:
+            fn()
+            ops.append(f"回滚: {desc}")
+        except Exception as e:
+            ops.append(f"回滚失败 ({desc}): {e}")
+    f.status = "failed"
+    return True, ops
+
+def fiber_commit(fiber_id):
+    """提交 fiber：合并 undo_log 到父 fiber（或全局栈），标记 committed。"""
+    f = _fibers.get(fiber_id)
+    if not f or f.status != "active":
+        return False
+    # 所有子 fiber 必须已终止
+    for child_id in f.children:
+        child = _fibers.get(child_id)
+        if child and child.status == "active":
+            return False  # 有未完成的子 fiber
+        if child and child.status == "failed":
+            return False  # 子 fiber 已失败，父不能提交
+    # 合并到父 fiber 或全局栈
+    if f.parent_id is not None and f.parent_id in _fibers:
+        parent = _fibers[f.parent_id]
+        if parent.status == "active":
+            parent.undo_log.extend(f.undo_log)
+    else:
+        _undo_stack.extend(f.undo_log)
+    f.undo_log.clear()
+    f.status = "committed"
+    return True
 
 # ── 路由引擎 ──
 
@@ -604,69 +696,8 @@ def create_app(cfg):
         return {"stack": [desc for desc, _ in _undo_stack]}
 
     # ── MCP 审批回调 ──
-    # 让统筹 Agent 通过 HTTP 调用 toggle，走审批缓存（同一 agent 同一操作 5 分钟内免审）
+    # 让统筹 Agent 通过 HTTP 调用 toggle，走审批缓存 + fiber 树形上下文
     _APPROVAL_TTL = 300  # 5 分钟
-
-    @app.post("/admin/mcp/toggle")
-    async def admin_mcp_toggle(request: Request):
-        """MCP 工具：切换 provider 启用/禁用状态，走审批缓存。
-        
-        请求体: {"agent_id": "hermes", "pool": "pool_a", "provider": "xiaomi", "reason": "rate limit"}
-        响应: {"approved": true, "action": "toggle", "provider": "xiaomi", "status": "disabled", "cached": false}
-        """
-        body = await request.json()
-        agent_id = body.get("agent_id", "unknown")
-        pool_name = body.get("pool", "")
-        provider_name = body.get("provider", "")
-        reason = body.get("reason", "")
-
-        if not pool_name or not provider_name:
-            raise HTTPException(status_code=422, detail="pool and provider required")
-
-        # 检查 provider 是否存在
-        found = False
-        for pn, pc in cfg.get("pools", {}).items():
-            for pv in pc.get("providers", []):
-                if pv["name"] == provider_name and pn == pool_name:
-                    found = True
-                    break
-        if not found:
-            raise HTTPException(status_code=404, detail=f"provider '{provider_name}' not found in pool '{pool_name}'")
-
-        # 计算操作 hash（同一 agent 同一 provider 同一操作免审）
-        import hashlib
-        action_hash = hashlib.md5(f"{agent_id}:{provider_name}:toggle".encode()).hexdigest()
-        now = time.time()
-        cached = action_hash in _approval_cache and _approval_cache[action_hash] > now
-
-        if not cached:
-            # 新操作 → 需要审批（模拟审批：记录到 pending，但这里直接通过+缓存）
-            # ponytail: 真实场景可对接外部审批系统，这里直接缓存授权
-            _approval_cache[action_hash] = now + _APPROVAL_TTL
-
-        # 执行 toggle
-        with _lock:
-            if provider_name in _disabled_providers:
-                _disabled_providers.discard(provider_name)
-                undo_register(f"MCP 启用 {provider_name} (by {agent_id})",
-                              lambda n=provider_name: _disabled_providers.add(n))
-                status = "enabled"
-            else:
-                _disabled_providers.add(provider_name)
-                undo_register(f"MCP 禁用 {provider_name} (by {agent_id})",
-                              lambda n=provider_name: _disabled_providers.discard(n))
-                status = "disabled"
-
-        return {
-            "approved": True,
-            "action": "toggle",
-            "provider": provider_name,
-            "pool": pool_name,
-            "status": status,
-            "reason": reason,
-            "cached": cached,
-            "agent_id": agent_id,
-        }
 
     @app.get("/admin/mcp/approvals")
     async def admin_mcp_approvals():
@@ -716,6 +747,116 @@ def create_app(cfg):
             } for pn, pc in cfg.get("pools", {}).items()},
             "providers": providers_status,
             "approvals_active": len([k for k, v in _approval_cache.items() if v > time.time()]),
+        }
+
+    # ── Fiber 树形上下文 API（Agent 任务级可逆） ──
+    @app.post("/admin/fiber/create")
+    async def admin_fiber_create(request: Request):
+        body = await request.json()
+        fid = fiber_create(
+            agent_id=body.get("agent_id", "unknown"),
+            description=body.get("description", ""),
+            parent_id=body.get("parent_id"),
+        )
+        f = _fibers[fid]
+        return {"fiber_id": fid, "parent_id": f.parent_id, "status": f.status, "description": f.description}
+
+    @app.post("/admin/fiber/{fiber_id}/fail")
+    async def admin_fiber_fail(fiber_id: int):
+        ok, ops = fiber_fail(fiber_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"fiber {fiber_id} not found or not active")
+        return {"fiber_id": fiber_id, "status": "failed", "rollback_ops": ops}
+
+    @app.post("/admin/fiber/{fiber_id}/commit")
+    async def admin_fiber_commit(fiber_id: int):
+        ok = fiber_commit(fiber_id)
+        if not ok:
+            raise HTTPException(status_code=409, detail=f"fiber {fiber_id} cannot commit: not active or children incomplete")
+        return {"fiber_id": fiber_id, "status": "committed"}
+
+    @app.get("/admin/fiber/tree")
+    async def admin_fiber_tree():
+        """返回 fiber 森林（含状态、undo_log 摘要、子节点）。"""
+        def _serialize(f):
+            return {
+                "id": f.id,
+                "parent_id": f.parent_id,
+                "agent_id": f.agent_id,
+                "description": f.description,
+                "status": f.status,
+                "undo_count": len(f.undo_log),
+                "children": sorted(f.children),
+                "created_at": datetime.datetime.fromtimestamp(f.created_at).isoformat(),
+            }
+        return {"fibers": {fid: _serialize(f) for fid, f in sorted(_fibers.items())}}
+
+    # MCP toggle 的 fiber 感知版本
+    @app.post("/admin/mcp/toggle")
+    async def admin_mcp_toggle(request: Request):
+        """MCP 工具：切换 provider 启用/禁用状态，走审批缓存。
+        支持 fiber_id 参数，操作注册到 fiber 而非全局 undo_stack。
+        """
+        body = await request.json()
+        agent_id = body.get("agent_id", "unknown")
+        pool_name = body.get("pool", "")
+        provider_name = body.get("provider", "")
+        reason = body.get("reason", "")
+        fiber_id = body.get("fiber_id")  # optional
+
+        if not pool_name or not provider_name:
+            raise HTTPException(status_code=422, detail="pool and provider required")
+
+        # 检查 provider 是否存在
+        found = False
+        for pn, pc in cfg.get("pools", {}).items():
+            for pv in pc.get("providers", []):
+                if pv["name"] == provider_name and pn == pool_name:
+                    found = True
+                    break
+        if not found:
+            raise HTTPException(status_code=404, detail=f"provider '{provider_name}' not found in pool '{pool_name}'")
+
+        # 计算操作 hash（同一 agent 同一 provider 同一操作免审）
+        import hashlib
+        action_hash = hashlib.md5(f"{agent_id}:{provider_name}:toggle".encode()).hexdigest()
+        now = time.time()
+        cached = action_hash in _approval_cache and _approval_cache[action_hash] > now
+
+        if not cached:
+            _approval_cache[action_hash] = now + _APPROVAL_TTL
+
+        # 执行 toggle
+        with _lock:
+            if provider_name in _disabled_providers:
+                _disabled_providers.discard(provider_name)
+                revert = lambda n=provider_name: _disabled_providers.add(n)
+                status = "enabled"
+            else:
+                _disabled_providers.add(provider_name)
+                revert = lambda n=provider_name: _disabled_providers.discard(n)
+                status = "disabled"
+
+        # 注册撤销：优先 fiber，无则全局栈
+        desc = f"MCP {'启用' if status == 'enabled' else '禁用'} {provider_name} (by {agent_id})"
+        if fiber_id is not None:
+            ok = fiber_register(fiber_id, desc, revert)
+            if not ok:
+                # fiber 不存在或已终止，回退到全局栈
+                undo_register(desc, revert)
+        else:
+            undo_register(desc, revert)
+
+        return {
+            "approved": True,
+            "action": "toggle",
+            "provider": provider_name,
+            "pool": pool_name,
+            "status": status,
+            "reason": reason,
+            "cached": cached,
+            "agent_id": agent_id,
+            "fiber_id": fiber_id,
         }
 
     return app
@@ -841,6 +982,36 @@ def main():
                 else:
                     for i, desc in enumerate(stack, 1):
                         print(f"  {i}. {desc}")
+        except Exception as e:
+            print(f"❌ 调用失败: {e}")
+
+    elif args[0] == "fiber":
+        """查看 fiber 树（通过 Admin API）"""
+        import urllib.request
+        gw_key = _config.get("gateway_key", "")
+        req = urllib.request.Request(f"http://127.0.0.1:8646/admin/fiber/tree",
+                                     headers={"Authorization": f"Bearer {gw_key}"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                fibers = data.get("fibers", {})
+                if not fibers:
+                    print("fiber 森林为空")
+                else:
+                    # 按 id 排序，树形缩进打印
+                    def _print_tree(fid, indent=0):
+                        f = fibers.get(str(fid))
+                        if not f:
+                            return
+                        prefix = "  " * indent + ("└─ " if indent > 0 else "")
+                        icon = {"active": "🟢", "committed": "✅", "failed": "❌"}.get(f["status"], "⚪")
+                        print(f"{prefix}{icon} #{f['id']} {f['description']} [{f['status']}] agent={f['agent_id']} undo={f['undo_count']}")
+                        for child_id in sorted(f["children"]):
+                            _print_tree(child_id, indent + 1)
+                    # 打印根节点（parent_id=None 的）
+                    for fid, f in sorted(fibers.items()):
+                        if f["parent_id"] is None:
+                            _print_tree(int(fid))
         except Exception as e:
             print(f"❌ 调用失败: {e}")
 
