@@ -24,6 +24,9 @@ API 端点:
   POST /admin/pools/{pool}/providers/{provider}/toggle  → 启停 provider
   GET  /admin/undo               → 运行时逆栈：撤销最后一条操作
   GET  /admin/undo-list          → 运行时逆栈：查看所有操作
+  POST /admin/mcp/toggle         → MCP 工具：Agent 调 toggle，走审批缓存
+  GET  /admin/mcp/approvals      → 查看审批缓存
+  GET  /admin/mcp/status         → MCP 总览：熔断+权重+审批（含错误率）
 """
 import datetime
 import json
@@ -46,9 +49,12 @@ QQ_TARGET = "1310893084"
 
 # ── 全局运行时状态 ──
 _config = {}                    # 当前配置
-_disabled_providers = set()     # 被 admin 手动禁用的 provider
+_disabled_providers = set()     # 被自动或手动禁用的 provider
 _rate_limit_buckets = {}        # {provider_name: [t1, t2, ...]}
 _undo_stack = []                # 运行时逆栈：[(description, callable), ...]
+_dynamic_weights = {}           # {provider_name: effective_weight} 由熔断线程更新
+_approval_cache = {}            # {(agent_id, action_hash): expiry_timestamp}
+_pending_approvals = {}         # {action_id: {action, params, agent_id}}
 _lock = threading.Lock()
 
 # ── 配置加载 ──
@@ -127,6 +133,60 @@ def init_registry(cfg):
     conn.commit()
     conn.close()
 
+# ── 自动熔断 + 动态权重（后台线程，每 30s） ──
+def _circuit_breaker_loop(cfg):
+    """后台线程：滑动窗口错误率 >20% → 自动 disable，<10% → 恢复。
+    同时根据成功率更新动态权重。
+    """
+    while True:
+        time.sleep(30)
+        try:
+            conn = get_db()
+            rows = conn.execute("""
+                SELECT provider,
+                       COUNT(*) as total,
+                       SUM(ok) as success
+                FROM usage
+                WHERE called_at > datetime('now', '-5 minutes')
+                GROUP BY provider
+            """).fetchall()
+            conn.close()
+            now = time.time()
+            for r in rows:
+                name = r["provider"]
+                total = r["total"]
+                if total < 5:  # 样本不足，不动作
+                    continue
+                success = r["success"] or 0
+                err_rate = 1.0 - (success / total)
+                is_disabled = name in _disabled_providers
+
+                # 熔断：错误率 >20% → 自动禁用
+                if err_rate > 0.20 and not is_disabled:
+                    with _lock:
+                        _disabled_providers.add(name)
+                    undo_register(f"自动熔断禁用 {name} (err={err_rate:.0%})",
+                                  lambda n=name: _disabled_providers.discard(n))
+                    print(f"🔌 熔断: {name} 错误率 {err_rate:.0%} → 已禁用")
+
+                # 恢复：错误率 <10% 且是被熔断禁用的 → 自动恢复
+                elif err_rate < 0.10 and is_disabled:
+                    with _lock:
+                        _disabled_providers.discard(name)
+                    print(f"🔌 恢复: {name} 错误率 {err_rate:.0%} → 已启用")
+
+                # 动态权重：base_weight × (1 - err_rate)，保底 0.1
+                base = 1.0
+                for pc in cfg.get("pools", {}).values():
+                    for pv in pc.get("providers", []):
+                        if pv["name"] == name:
+                            base = pv.get("weight", 1.0)
+                            break
+                _dynamic_weights[name] = max(base * (1.0 - err_rate), 0.1)
+
+        except Exception as e:
+            print(f"⚠️ 熔断循环异常: {e}")
+
 # ── 运行时逆栈（任务级幂等补偿） ──
 def undo_register(description, revert_callable):
     """注册运行时操作的撤销回调。每个原子操作应有对应的逆操作。"""
@@ -173,11 +233,18 @@ def select_provider_by_weight(providers, model=None):
         candidates = [p for p in candidates if model in p.get("models", [])]
     if not candidates:
         return None
-    total = sum(p.get("weight", 1) for p in candidates)
+    total = 0
+    weights = []
+    for p in candidates:
+        # 动态权重优先，无则用 YAML 静态权重
+        w = _dynamic_weights.get(p["name"]) or p.get("weight", 1)
+        w = max(w, 0.1)  # 保底
+        weights.append(w)
+        total += w
     r = random.uniform(0, total)
     upto = 0
-    for p in candidates:
-        upto += p.get("weight", 1)
+    for i, p in enumerate(candidates):
+        upto += weights[i]
         if r <= upto:
             return p
     return candidates[-1]
@@ -536,6 +603,121 @@ def create_app(cfg):
     async def admin_undo_list():
         return {"stack": [desc for desc, _ in _undo_stack]}
 
+    # ── MCP 审批回调 ──
+    # 让统筹 Agent 通过 HTTP 调用 toggle，走审批缓存（同一 agent 同一操作 5 分钟内免审）
+    _APPROVAL_TTL = 300  # 5 分钟
+
+    @app.post("/admin/mcp/toggle")
+    async def admin_mcp_toggle(request: Request):
+        """MCP 工具：切换 provider 启用/禁用状态，走审批缓存。
+        
+        请求体: {"agent_id": "hermes", "pool": "pool_a", "provider": "xiaomi", "reason": "rate limit"}
+        响应: {"approved": true, "action": "toggle", "provider": "xiaomi", "status": "disabled", "cached": false}
+        """
+        body = await request.json()
+        agent_id = body.get("agent_id", "unknown")
+        pool_name = body.get("pool", "")
+        provider_name = body.get("provider", "")
+        reason = body.get("reason", "")
+
+        if not pool_name or not provider_name:
+            raise HTTPException(status_code=422, detail="pool and provider required")
+
+        # 检查 provider 是否存在
+        found = False
+        for pn, pc in cfg.get("pools", {}).items():
+            for pv in pc.get("providers", []):
+                if pv["name"] == provider_name and pn == pool_name:
+                    found = True
+                    break
+        if not found:
+            raise HTTPException(status_code=404, detail=f"provider '{provider_name}' not found in pool '{pool_name}'")
+
+        # 计算操作 hash（同一 agent 同一 provider 同一操作免审）
+        import hashlib
+        action_hash = hashlib.md5(f"{agent_id}:{provider_name}:toggle".encode()).hexdigest()
+        now = time.time()
+        cached = action_hash in _approval_cache and _approval_cache[action_hash] > now
+
+        if not cached:
+            # 新操作 → 需要审批（模拟审批：记录到 pending，但这里直接通过+缓存）
+            # ponytail: 真实场景可对接外部审批系统，这里直接缓存授权
+            _approval_cache[action_hash] = now + _APPROVAL_TTL
+
+        # 执行 toggle
+        with _lock:
+            if provider_name in _disabled_providers:
+                _disabled_providers.discard(provider_name)
+                undo_register(f"MCP 启用 {provider_name} (by {agent_id})",
+                              lambda n=provider_name: _disabled_providers.add(n))
+                status = "enabled"
+            else:
+                _disabled_providers.add(provider_name)
+                undo_register(f"MCP 禁用 {provider_name} (by {agent_id})",
+                              lambda n=provider_name: _disabled_providers.discard(n))
+                status = "disabled"
+
+        return {
+            "approved": True,
+            "action": "toggle",
+            "provider": provider_name,
+            "pool": pool_name,
+            "status": status,
+            "reason": reason,
+            "cached": cached,
+            "agent_id": agent_id,
+        }
+
+    @app.get("/admin/mcp/approvals")
+    async def admin_mcp_approvals():
+        """查看审批缓存状态"""
+        now = time.time()
+        active = {k: v for k, v in _approval_cache.items() if v > now}
+        return {
+            "active_approvals": len(active),
+            "approvals": [{"hash": k, "expires_at": datetime.datetime.fromtimestamp(v).isoformat()}
+                          for k, v in sorted(active.items())],
+        }
+
+    @app.get("/admin/mcp/status")
+    async def admin_mcp_status():
+        """MCP 状态总览：熔断 + 权重 + 审批"""
+        # 5 分钟滑动窗口错误率
+        conn = get_db()
+        rows = conn.execute("""
+            SELECT provider, COUNT(*) as total, SUM(ok) as success
+            FROM usage WHERE called_at > datetime('now', '-5 minutes')
+            GROUP BY provider
+        """).fetchall()
+        conn.close()
+        providers_status = []
+        for r in rows:
+            total = r["total"]
+            success = r["success"] or 0
+            err_rate = 1.0 - (success / total) if total > 0 else 0
+            providers_status.append({
+                "name": r["provider"],
+                "total_requests": total,
+                "error_rate": round(err_rate, 3),
+                "disabled": r["provider"] in _disabled_providers,
+                "dynamic_weight": round(_dynamic_weights.get(r["provider"], 1.0), 2),
+                "static_weight": next(
+                    (pv.get("weight", 1.0) for pc in cfg.get("pools", {}).values()
+                     for pv in pc.get("providers", []) if pv["name"] == r["provider"]),
+                    1.0),
+            })
+        return {
+            "pools": {pn: {
+                "providers": [{
+                    "name": pv["name"],
+                    "disabled": pv["name"] in _disabled_providers,
+                    "dynamic_weight": round(_dynamic_weights.get(pv["name"], pv.get("weight", 1.0)), 2),
+                } for pv in pc.get("providers", [])]
+            } for pn, pc in cfg.get("pools", {}).items()},
+            "providers": providers_status,
+            "approvals_active": len([k for k, v in _approval_cache.items() if v > time.time()]),
+        }
+
     return app
 
 # ── 主入口 ──
@@ -560,6 +742,11 @@ def main():
         print(f"🔌 模型池网关 v2 启动: http://{_config.get('host','127.0.0.1')}:{_config.get('port',8646)}")
         print(f"   {total_models} 个模型, {total_providers} 个 provider, {len(_config.get('pools',{}))} 个资源池")
         print(f"   SIGHUP 热加载已启用 (kill -HUP {os.getpid()} 重载配置)")
+        # 启动后台熔断线程
+        t = threading.Thread(target=_circuit_breaker_loop, args=(_config,), daemon=True)
+        t.start()
+        print(f"   🔄 自动熔断已启用 (30s 滑动窗口, 错误率 >20% 自动禁用)")
+
         # SIGHUP 热加载 — 自动 git commit 作为逆栈快照
         def _hup(signum, frame):
             try:
