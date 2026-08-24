@@ -471,11 +471,19 @@ def main():
         print(f"🔌 模型池网关 v2 启动: http://{_config.get('host','127.0.0.1')}:{_config.get('port',8646)}")
         print(f"   {total_models} 个模型, {total_providers} 个 provider, {len(_config.get('pools',{}))} 个资源池")
         print(f"   SIGHUP 热加载已启用 (kill -HUP {os.getpid()} 重载配置)")
-        # SIGHUP 热加载
+        # SIGHUP 热加载 — 自动 git commit 作为逆栈快照
         def _hup(signum, frame):
             try:
+                # 先 commit 当前配置作为回滚点
+                subprocess.run(
+                    ["git", "add", "gateway.yaml", "gateway.py"],
+                    cwd=BASE, capture_output=True, timeout=10)
+                subprocess.run(
+                    ["git", "commit", "--allow-empty", "-m",
+                     f"auto-snap before SIGHUP {datetime.datetime.now().strftime('%H:%M:%S')}"],
+                    cwd=BASE, capture_output=True, timeout=10)
                 reload_config()
-                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 配置已热加载")
+                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 配置已热加载 (git snap)")
             except Exception as e:
                 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 配置重载失败: {e}")
         signal.signal(signal.SIGHUP, _hup)
@@ -498,6 +506,12 @@ def main():
 
     elif args[0] == "usage":
         cmd_usage(_config)
+
+    elif args[0] == "git-log":
+        subprocess.run(["git", "log", "--oneline", "-20"], cwd=BASE)
+
+    elif args[0] == "git-diff":
+        subprocess.run(["git", "diff", "HEAD", "--", "gateway.yaml"], cwd=BASE)
 
     else:
         print(f"未知命令: {args[0]}")
