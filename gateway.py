@@ -61,9 +61,14 @@ def load_config(path=None):
 def reload_config():
     global _config, _disabled_providers
     new_cfg = load_config()
-    _config = new_cfg
+    if _config:
+        # 原地替换，让 create_app 闭包中的 cfg 引用也看到新值
+        _config.clear()
+        _config.update(new_cfg)
+    else:
+        _config = new_cfg
     _disabled_providers.clear()  # 同步：YAML 回滚后运行时状态一并重置
-    return new_cfg
+    return _config
 
 # ── 数据库 ──
 def get_db():
@@ -272,6 +277,15 @@ def create_app(cfg):
     # ── 健康检查 ──
     @app.get("/health")
     async def health():
+        # 更新池健康指标
+        for pool_name, pool_cfg in cfg.get("pools", {}).items():
+            enabled = sum(1 for pv in pool_cfg.get("providers", [])
+                          if pv["name"] not in _disabled_providers)
+            app.state.pool_health.labels(pool=pool_name).set(1 if enabled > 0 else 0)
+        for pool_name, pool_cfg in cfg.get("pools", {}).items():
+            for pv in pool_cfg.get("providers", []):
+                app.state.provider_up.labels(provider=pv["name"]).set(
+                    0 if pv["name"] in _disabled_providers else 1)
         return {"status": "ok", "version": "0.2.0", "time": datetime.datetime.now().isoformat()}
 
     # ── 模型列表 ──
@@ -291,6 +305,7 @@ def create_app(cfg):
     # ── 聊天补全（三池路由核心） ──
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
+        t0 = time.time()
         body = await request.json()
         model = body.get("model", "DeepSeek-V4-Flash")
         messages = body.get("messages", [])
@@ -313,6 +328,7 @@ def create_app(cfg):
         tried_pools = set()
         current_pool = pool_name
         last_error = "no available provider"
+        used_provider = ""
 
         while current_pool and current_pool not in tried_pools:
             tried_pools.add(current_pool)
@@ -337,9 +353,12 @@ def create_app(cfg):
             if not check_rate_limit(pv["name"], provider_cfg.get("max_rps")):
                 last_error = f"provider '{pv['name']}' rate limited"
                 # 限流不触发 fallback，只是拒绝这次请求
+                app.state.req_counter.labels(pool=current_pool, provider=pv["name"], status="429").inc()
+                app.state.req_duration.labels(provider=pv["name"]).observe(time.time() - t0)
                 raise HTTPException(status_code=429, detail=last_error)
 
             # 6. 发起调用
+            used_provider = pv["name"]
             try:
                 async with httpx.AsyncClient(timeout=120) as client:
                     api = provider_cfg["api"].rstrip("/")
@@ -371,6 +390,8 @@ def create_app(cfg):
 
                     # 失败但不 fallback 的情况（HTTP 4xx 是客户端问题）
                     if status_code in (400, 401, 403, 404, 422):
+                        app.state.req_counter.labels(pool=current_pool, provider=pv["name"], status=str(status_code)).inc()
+                        app.state.req_duration.labels(provider=pv["name"]).observe(time.time() - t0)
                         return Response(content=resp_body, status_code=status_code, media_type="application/json")
 
                     # 5xx → fallback 到下一个池
@@ -379,6 +400,8 @@ def create_app(cfg):
                         current_pool = pool_cfg.get("fallback")
                         continue
 
+                    app.state.req_counter.labels(pool=current_pool, provider=pv["name"], status="200").inc()
+                    app.state.req_duration.labels(provider=pv["name"]).observe(time.time() - t0)
                     return Response(content=resp_body, status_code=status_code, media_type="application/json")
 
             except httpx.TimeoutException:
@@ -394,19 +417,29 @@ def create_app(cfg):
                 current_pool = pool_cfg.get("fallback")
                 continue
 
+        app.state.req_counter.labels(pool=pool_name, provider=used_provider or "none", status="503").inc()
+        app.state.req_duration.labels(provider=used_provider or "none").observe(time.time() - t0)
         raise HTTPException(status_code=503, detail=f"all pools exhausted: {last_error}")
 
-    # ── Prometheus 指标 ──
+    # ── Prometheus 指标（模块级，避免重复注册） ──
+    _prometheus_registered = False
+    def _ensure_prometheus():
+        nonlocal _prometheus_registered
+        if _prometheus_registered:
+            return
+        from prometheus_client import Counter, Gauge, Histogram
+        app.state.req_counter = Counter("gateway_requests_total", "Total requests", ["pool", "provider", "status"])
+        app.state.pool_health = Gauge("gateway_pool_healthy", "Pool health 1/0", ["pool"])
+        app.state.provider_up = Gauge("gateway_provider_up", "Provider up 1/0", ["provider"])
+        app.state.req_duration = Histogram("gateway_request_duration_seconds", "Request latency",
+                                           ["provider"], buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0])
+        _prometheus_registered = True
+
+    _ensure_prometheus()
+
     @app.get("/metrics")
     async def metrics():
-        from prometheus_client import generate_latest, REGISTRY, Counter, Gauge, Histogram
-        # 注册指标（幂等）
-        if "gateway_requests_total" not in [m.name for m in REGISTRY.collect()]:
-            Counter("gateway_requests_total", "Total requests", ["pool", "provider", "status"])
-            Gauge("gateway_pool_healthy", "Pool health 1/0", ["pool"])
-            Gauge("gateway_provider_up", "Provider up 1/0", ["provider"])
-            Histogram("gateway_request_duration_seconds", "Request latency", ["provider"],
-                      buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0])
+        from prometheus_client import generate_latest, REGISTRY
         return Response(content=generate_latest(REGISTRY).decode(), media_type="text/plain")
 
     # ── Admin API ──
