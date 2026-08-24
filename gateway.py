@@ -17,8 +17,9 @@ OpenAI 兼容接口，按 model 名路由到三池，池内权重轮询，跨池
   python3 gateway.py fiber              # 查看 fiber 树（通过 Admin API）
 
 API 端点:
+  GET  /chat                    → 聊天页面（免鉴权，自备 Key）
   GET  /v1/models                → 模型目录（含池/provider/健康/用量）
-  POST /v1/chat/completions      → OpenAI 兼容，三池路由 + 故障转移
+  POST /v1/chat/completions      → OpenAI 兼容，三池路由 + 自定义 Key
   GET  /health                   → 网关自身健康检查
   GET  /metrics                  → Prometheus 指标
   GET  /admin/pools              → 查看各池/provider 状态
@@ -463,7 +464,7 @@ def create_app(cfg):
     # ── 鉴权中间件 ──
     @app.middleware("http")
     async def auth_check(request: Request, call_next):
-        if request.url.path in ("/health", "/metrics"):
+        if request.url.path in ("/health", "/metrics", "/chat"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         expected = f"Bearer {cfg['gateway_key']}"
@@ -484,6 +485,138 @@ def create_app(cfg):
                 app.state.provider_up.labels(provider=pv["name"]).set(
                     0 if pv["name"] in _disabled_providers else 1)
         return {"status": "ok", "version": "0.2.0", "time": datetime.datetime.now().isoformat()}
+
+    # ── 聊天页面（免鉴权） ──
+    @app.get("/chat")
+    async def chat_page():
+        """简洁的聊天入口，用户带自己的 key 走三池路由"""
+        gw_key = cfg.get("gateway_key", "")
+        # 收集可用模型
+        all_models = []
+        for pool_name, pool_cfg in cfg.get("pools", {}).items():
+            for pv in pool_cfg.get("providers", []):
+                for m in pv.get("models", []):
+                    if m not in all_models:
+                        all_models.append(m)
+        model_options = "\n".join(f'<option value="{m}">{m}</option>' for m in all_models)
+
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>模型池网关 · 聊天</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, "Segoe UI", sans-serif; background: #f5f5f5; height: 100vh; display: flex; flex-direction: column; }}
+  .header {{ background: #1a1a2e; color: #eee; padding: 14px 24px; display: flex; align-items: center; gap: 16px; }}
+  .header h1 {{ font-size: 18px; font-weight: 600; }}
+  .header span {{ font-size: 12px; color: #888; }}
+  .toolbar {{ display: flex; gap: 12px; padding: 12px 24px; background: #fff; border-bottom: 1px solid #e0e0e0; align-items: center; flex-wrap: wrap; }}
+  .toolbar label {{ font-size: 13px; color: #555; }}
+  .toolbar select, .toolbar input {{ padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; }}
+  .toolbar input[type="text"] {{ flex: 1; min-width: 160px; }}
+  .toolbar .status {{ font-size: 12px; color: #888; margin-left: auto; }}
+  #messages {{ flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }}
+  .msg {{ max-width: 80%; padding: 12px 16px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; }}
+  .msg.user {{ align-self: flex-end; background: #1a73e8; color: #fff; border-bottom-right-radius: 4px; }}
+  .msg.assistant {{ align-self: flex-start; background: #fff; color: #222; border: 1px solid #e0e0e0; border-bottom-left-radius: 4px; }}
+  .msg.system {{ align-self: center; background: #fff3cd; color: #856404; font-size: 12px; border-radius: 6px; }}
+  .msg .meta {{ font-size: 11px; color: #999; margin-top: 6px; }}
+  .input-area {{ display: flex; gap: 8px; padding: 16px 24px; background: #fff; border-top: 1px solid #e0e0e0; }}
+  .input-area textarea {{ flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 8px; resize: none; font-size: 14px; min-height: 44px; max-height: 120px; }}
+  .input-area button {{ padding: 10px 24px; background: #1a73e8; color: #fff; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; }}
+  .input-area button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+  .loading {{ display: inline-block; width: 16px; height: 16px; border: 2px solid #ccc; border-top-color: #1a73e8; border-radius: 50%; animation: spin 0.8s linear infinite; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>🗣 模型池</h1>
+  <span>三池路由 · 自备 Key</span>
+</div>
+<div class="toolbar">
+  <label>模型</label>
+  <select id="model">{model_options}</select>
+  <label>Key</label>
+  <input type="text" id="api_key" placeholder="sk-..." value="">
+  <span class="status" id="status">就绪</span>
+</div>
+<div id="messages"></div>
+<div class="input-area">
+  <textarea id="input" placeholder="输入消息..." rows="1"></textarea>
+  <button id="send">发送</button>
+</div>
+<script>
+  const el = id => document.getElementById(id);
+  const msgBox = el('messages');
+  const input = el('input');
+  const sendBtn = el('send');
+  const status = el('status');
+  let loading = false;
+
+  function addMsg(role, content, meta) {{
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    div.textContent = content;
+    if (meta) {{
+      const m = document.createElement('div');
+      m.className = 'meta';
+      m.textContent = meta;
+      div.appendChild(m);
+    }}
+    msgBox.appendChild(div);
+    msgBox.scrollTop = msgBox.scrollHeight;
+  }}
+
+  input.addEventListener('input', () => {{
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+  }});
+  input.addEventListener('keydown', e => {{
+    if (e.key === 'Enter' && !e.shiftKey) {{ e.preventDefault(); send(); }}
+  }});
+
+  async def send() {{
+    const model = el('model').value;
+    const key = el('api_key').value.trim();
+    const text = input.value.trim();
+    if (!text || loading) return;
+    if (!key) {{ addMsg('system', '请在上方输入你的 API Key'); return; }}
+    addMsg('user', text);
+    input.value = '';
+    input.style.height = 'auto';
+    loading = true;
+    sendBtn.disabled = true;
+    status.textContent = '请求中...';
+    try {{
+      const resp = await fetch('/v1/chat/completions', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json', 'Authorization': 'Bearer {gw_key}' }},
+        body: JSON.stringify({{ model, messages: [{{ role: 'user', content: text }}], api_key: key }})
+      }});
+      if (!resp.ok) {{
+        const err = await resp.json().catch(() => ({{}}));
+        addMsg('system', `请求失败: ${{err.error || resp.statusText}} (HTTP ${{resp.status}})`);
+        return;
+      }}
+      const data = await resp.json();
+      const reply = data.choices?.[0]?.message?.content || '(空响应)';
+      const usage = data.usage ? `⬆${{data.usage.prompt_tokens||0}} ⬇${{data.usage.completion_tokens||0}}` : '';
+      addMsg('assistant', reply, usage);
+    }} catch(e) {{
+      addMsg('system', '网络错误: ' + e.message);
+    }} finally {{
+      loading = false;
+      sendBtn.disabled = false;
+      status.textContent = '就绪';
+    }}
+  }}
+</script>
+</body>
+</html>"""
+        return Response(html, media_type="text/html")
 
     # ── 模型列表 ──
     @app.get("/v1/models")
@@ -507,6 +640,8 @@ def create_app(cfg):
         model = body.get("model", "DeepSeek-V4-Flash")
         messages = body.get("messages", [])
         stream = body.get("stream", False)
+        # 用户自定义 key（从聊天页面带入），覆盖 provider 配置的 key
+        user_key = body.pop("api_key", None)
         kwargs = {k: v for k, v in body.items() if k not in ("model", "messages", "stream")}
 
         # 1. 关键词路由（最高优先级）
@@ -533,15 +668,20 @@ def create_app(cfg):
             if not pool_cfg:
                 break
 
-            # 4. 按权重选 provider（只选有该模型的）
-            pv = select_provider_by_weight(pool_cfg.get("providers", []), model=model)
+            # 4. 按权重选 provider
+            # 用户自定义 key 时不限制模型名（用户用自己的 key 调任何 provider），
+            # 否则只选有该模型的 provider
+            model_filter = None if user_key else model
+            pv = select_provider_by_weight(pool_cfg.get("providers", []), model=model_filter)
             if not pv:
                 last_error = f"pool '{current_pool}' all providers disabled"
                 current_pool = pool_cfg.get("fallback")
                 continue
 
             provider_cfg = cfg.get("providers", {}).get(pv["name"])
-            if not provider_cfg or not provider_cfg.get("api_key") or provider_cfg["api_key"].startswith("${"):
+            # 有效 key：用户自定义 key 优先，否则用 provider 配置的 key
+            effective_key = user_key or provider_cfg.get("api_key", "") if provider_cfg else user_key
+            if not provider_cfg or not effective_key or (not user_key and provider_cfg.get("api_key", "").startswith("${")):
                 last_error = f"provider '{pv['name']}' key not resolved"
                 current_pool = pool_cfg.get("fallback")
                 continue
@@ -563,7 +703,7 @@ def create_app(cfg):
                     resp = await client.post(
                         f"{api}/chat/completions",
                         json=req_body,
-                        headers={"Authorization": f"Bearer {provider_cfg['api_key']}"},
+                        headers={"Authorization": f"Bearer {effective_key}"},
                     )
                     status_code = resp.status_code
                     resp_body = resp.text

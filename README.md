@@ -45,12 +45,23 @@ python3 gateway.py git-log            # 配置变更历史
 python3 gateway.py git-diff           # 未提交的配置变更
 ```
 
+## 聊天页面（免鉴权）
+
+打开浏览器访问 `http://<网关地址>:8646/chat`
+
+- 选择模型
+- 输入你自己的 API Key
+- 发送消息
+
+网关用你的 Key 调用上游 provider，走三池路由 + 故障转移。Key 不在网关落地，仅透传。
+
 ## 关键端点
 
 | 端点 | 说明 |
 |------|------|
 | `GET /health` | 健康检查（免鉴权） |
-| `POST /v1/chat/completions` | OpenAI 兼容推理 |
+| `GET /chat` | 聊天页面（免鉴权） |
+| `POST /v1/chat/completions` | OpenAI 兼容推理（支持 `api_key` 字段透传自定义 Key） |
 | `GET /v1/models` | 模型目录 |
 | `GET /metrics` | Prometheus 指标 |
 | `GET /admin/pools` | 池/provider 状态 |
