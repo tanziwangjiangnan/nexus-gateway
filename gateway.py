@@ -9,6 +9,11 @@ OpenAI 兼容接口，按 model 名路由到三池，池内权重轮询，跨池
   python3 gateway.py probe --watch      # 持续探测，异常→QQ告警
   python3 gateway.py models             # 列出模型目录
   python3 gateway.py usage              # 查看用量
+  python3 gateway.py git-log            # 配置逆栈：commit 历史
+  python3 gateway.py git-diff           # 配置逆栈：未提交变更
+  python3 gateway.py sync-runtime       # 运行时同步（发 SIGHUP 重载）
+  python3 gateway.py undo               # 运行时逆栈：撤销最后一条操作
+  python3 gateway.py undo-list          # 运行时逆栈：查看所有操作
 
 API 端点:
   GET  /v1/models                → 模型目录（含池/provider/健康/用量）
@@ -17,6 +22,8 @@ API 端点:
   GET  /metrics                  → Prometheus 指标
   GET  /admin/pools              → 查看各池/provider 状态
   POST /admin/pools/{pool}/providers/{provider}/toggle  → 启停 provider
+  GET  /admin/undo               → 运行时逆栈：撤销最后一条操作
+  GET  /admin/undo-list          → 运行时逆栈：查看所有操作
 """
 import datetime
 import json
@@ -41,6 +48,7 @@ QQ_TARGET = "1310893084"
 _config = {}                    # 当前配置
 _disabled_providers = set()     # 被 admin 手动禁用的 provider
 _rate_limit_buckets = {}        # {provider_name: [t1, t2, ...]}
+_undo_stack = []                # 运行时逆栈：[(description, callable), ...]
 _lock = threading.Lock()
 
 # ── 配置加载 ──
@@ -59,15 +67,24 @@ def load_config(path=None):
     return cfg
 
 def reload_config():
+    """重载 YAML 配置，同步运行时状态，清空运行时逆栈。
+    
+    幂等补偿说明：
+    1. YAML 文件 → 原地替换 _config（闭包引用同步）
+    2. _disabled_providers.clear() — 运行时禁用状态重置
+       （防止 git revert 后 YAML 变回但某 provider 仍被禁用）
+    3. _undo_stack.clear() — 运行时逆栈清空，新配置是新起点
+    4. _rate_limit_buckets 不清（滑动窗口，自动过期）
+    """
     global _config, _disabled_providers
     new_cfg = load_config()
     if _config:
-        # 原地替换，让 create_app 闭包中的 cfg 引用也看到新值
         _config.clear()
         _config.update(new_cfg)
     else:
         _config = new_cfg
-    _disabled_providers.clear()  # 同步：YAML 回滚后运行时状态一并重置
+    _disabled_providers.clear()
+    undo_clear("配置重载")
     return _config
 
 # ── 数据库 ──
@@ -109,6 +126,27 @@ def init_registry(cfg):
                      pool_cfg.get("description", "")))
     conn.commit()
     conn.close()
+
+# ── 运行时逆栈（任务级幂等补偿） ──
+def undo_register(description, revert_callable):
+    """注册运行时操作的撤销回调。每个原子操作应有对应的逆操作。"""
+    _undo_stack.append((description, revert_callable))
+
+def undo_pop():
+    """弹出并执行最后一条撤销回调。"""
+    if not _undo_stack:
+        return False, "undo_stack 为空"
+    desc, fn = _undo_stack.pop()
+    try:
+        fn()
+        return True, f"已撤销: {desc}"
+    except Exception as e:
+        _undo_stack.append((desc, fn))  # 失败放回，留给重试
+        return False, f"撤销失败 ({desc}): {e}"
+
+def undo_clear(reason=""):
+    """清空逆栈（配置热加载时调用，因为新配置是新起点）。"""
+    _undo_stack.clear()
 
 # ── 路由引擎 ──
 
@@ -479,10 +517,24 @@ def create_app(cfg):
         with _lock:
             if provider_name in _disabled_providers:
                 _disabled_providers.discard(provider_name)
+                undo_register(f"启用 {provider_name}",
+                              lambda n=provider_name: _disabled_providers.add(n))
                 return {"provider": provider_name, "status": "enabled"}
             else:
                 _disabled_providers.add(provider_name)
+                undo_register(f"禁用 {provider_name}",
+                              lambda n=provider_name: _disabled_providers.discard(n))
                 return {"provider": provider_name, "status": "disabled"}
+
+    # ── 运行时逆栈 Admin API ──
+    @app.get("/admin/undo")
+    async def admin_undo():
+        ok, msg = undo_pop()
+        return {"ok": ok, "message": msg}
+
+    @app.get("/admin/undo-list")
+    async def admin_undo_list():
+        return {"stack": [desc for desc, _ in _undo_stack]}
 
     return app
 
@@ -556,7 +608,13 @@ def main():
         subprocess.run(["git", "diff", "HEAD", "--", "gateway.yaml"], cwd=BASE)
 
     elif args[0] == "sync-runtime":
-        # 向运行中的网关进程发 SIGHUP，触发 reload_config()
+        """向运行中进程发 SIGHUP → 触发 reload_config()
+        
+        幂等补偿行为：
+        1. 重读 YAML 并原地替换 _config
+        2. 清空 _disabled_providers（恢复所有 provider 为启用状态）
+        3. 清空 _undo_stack（运行时逆栈，新配置是新起点）
+        """
         pid_file = os.path.join(BASE, "gateway.pid")
         if os.path.exists(pid_file):
             with open(pid_file) as f:
@@ -566,6 +624,38 @@ def main():
         else:
             print(f"⚠️  未找到 pid 文件，尝试 systemctl reload gateway")
             subprocess.run(["systemctl", "reload", "gateway"])
+
+    elif args[0] == "undo":
+        """撤销运行时逆栈的最后一条操作（通过 Admin API）"""
+        import urllib.request
+        gw_key = _config.get("gateway_key", "")
+        req = urllib.request.Request(f"http://127.0.0.1:8646/admin/undo",
+                                     headers={"Authorization": f"Bearer {gw_key}"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                icon = "✅" if data.get("ok") else "❌"
+                print(f"{icon} {data.get('message', '')}")
+        except Exception as e:
+            print(f"❌ 调用失败: {e}")
+
+    elif args[0] == "undo-list":
+        """查看运行时逆栈（通过 Admin API）"""
+        import urllib.request
+        gw_key = _config.get("gateway_key", "")
+        req = urllib.request.Request(f"http://127.0.0.1:8646/admin/undo-list",
+                                     headers={"Authorization": f"Bearer {gw_key}"})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                stack = data.get("stack", [])
+                if not stack:
+                    print("运行时逆栈为空")
+                else:
+                    for i, desc in enumerate(stack, 1):
+                        print(f"  {i}. {desc}")
+        except Exception as e:
+            print(f"❌ 调用失败: {e}")
 
     else:
         print(f"未知命令: {args[0]}")
