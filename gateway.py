@@ -59,9 +59,10 @@ def load_config(path=None):
     return cfg
 
 def reload_config():
-    global _config
+    global _config, _disabled_providers
     new_cfg = load_config()
     _config = new_cfg
+    _disabled_providers.clear()  # 同步：YAML 回滚后运行时状态一并重置
     return new_cfg
 
 # ── 数据库 ──
@@ -464,6 +465,9 @@ def main():
     if not args:
         import uvicorn
         app = create_app(_config)
+        # 写 PID 文件
+        with open(os.path.join(BASE, "gateway.pid"), "w") as f:
+            f.write(str(os.getpid()))
         total_models = sum(len(pv.get("models", []))
                            for pc in _config.get("pools", {}).values()
                            for pv in pc.get("providers", []))
@@ -487,7 +491,12 @@ def main():
             except Exception as e:
                 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 配置重载失败: {e}")
         signal.signal(signal.SIGHUP, _hup)
-        uvicorn.run(app, host=_config.get("host", "127.0.0.1"), port=_config.get("port", 8646), log_level="info")
+        try:
+            uvicorn.run(app, host=_config.get("host", "127.0.0.1"), port=_config.get("port", 8646), log_level="info")
+        finally:
+            pid_file = os.path.join(BASE, "gateway.pid")
+            if os.path.exists(pid_file):
+                os.remove(pid_file)
 
     elif args[0] == "probe":
         watch = "--watch" in args
@@ -512,6 +521,18 @@ def main():
 
     elif args[0] == "git-diff":
         subprocess.run(["git", "diff", "HEAD", "--", "gateway.yaml"], cwd=BASE)
+
+    elif args[0] == "sync-runtime":
+        # 向运行中的网关进程发 SIGHUP，触发 reload_config()
+        pid_file = os.path.join(BASE, "gateway.pid")
+        if os.path.exists(pid_file):
+            with open(pid_file) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGHUP)
+            print(f"✅ 已向 PID {pid} 发送 SIGHUP，运行时同步中")
+        else:
+            print(f"⚠️  未找到 pid 文件，尝试 systemctl reload gateway")
+            subprocess.run(["systemctl", "reload", "gateway"])
 
     else:
         print(f"未知命令: {args[0]}")
