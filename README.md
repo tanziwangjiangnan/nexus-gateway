@@ -349,4 +349,6 @@ SIGHUP 热加载：自动 git commit 快照 + 清空运行时状态 + 重启生�
 | v2.5 | `scan-agents` 自动发现：扫描目录→交互确认→写入 YAML→热加载 | 2026-08-25 |
 | v2.5 | 日志聚合 `/admin/logs`：统一读取所有 Agent 日志，按时间合并，level/agent 过滤 | 2026-08-25 |
 | v2.5 | 统一插件调用 `POST /v1/plugins/{id}/call`：capabilities 校验 + 审批缓存 + Fiber 逆操作 | 2026-08-25 |
+| v2.5 | Agent 插件发现：`/admin/agents/declaration?agent_id=xxx` 返回可调用插件列表 | 2026-08-25 |
+| v2.5 | `scan-agents` 自动发现 `plugins.yaml`：Agent 目录下插件清单自动声明 | 2026-08-25 |
 | v2.6 | 执行者-检查者模式：`/admin/fiber/check`，级联回滚，capabilities 权限校验，检查者证据 | 2026-08-25 |
