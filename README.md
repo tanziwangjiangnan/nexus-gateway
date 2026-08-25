@@ -73,6 +73,9 @@ python3 gateway.py git-diff           # 未提交的配置变更
 | `POST /admin/fiber/{id}/commit` | 提交/合并 undo |
 | `GET /admin/undo` | 撤销上一条运行时操作 |
 | `GET /admin/undo-list` | 查看运行时逆栈 |
+| `GET /admin/agents/declaration` | 返回智能体声明配置（agents 段） |
+| `GET /admin/agents/status` | 返回所有声明 Agent 的存活状态 |
+| `POST /admin/fiber/check` | 创建检查任务 fiber（执行者-检查者模式） |
 
 ## 配置
 
@@ -88,6 +91,76 @@ pools:
         api: https://api.scnet.cn/v1
         api_key: sk-xxx
 ```
+
+## 智能体声明式接入
+
+在 `gateway.yaml` 中声明已有智能体的位置，网关自动发现并接入。**不迁移、不复制任何用户文件。**
+
+```yaml
+agents:
+  - id: openhands
+    display_name: "OpenHands"
+    type: openhands
+    workspace: /home/user/openhands/workspace
+    capabilities:
+      - read
+      - write
+      - execute
+
+  - id: hermes-checker
+    display_name: "Hermes 检查者"
+    type: generic
+    command: python3 /opt/hermes/checker.py --daemon
+    pid_file: /tmp/hermes-checker.pid
+    capabilities:
+      - read
+      - validate
+      - inspect
+```
+
+`GET /admin/agents/declaration` 返回完整声明，智能体启动时自动调用此端点完成接入。
+
+`GET /admin/agents/status` 根据 type 探测存活状态：
+- `openhands`: 检查 workspace 下锁文件/PID
+- `astrbot`: GET base_url/health，超时 2s
+- `generic`: 检查 pid_file 是否存在且进程存活
+
+## 执行者-检查者模式
+
+执行者负责干活，检查者负责验收。两者角色分离：
+
+| 角色 | 职责 | 权限 |
+|------|------|------|
+| 执行者（Executor） | 根据用户需求执行任务（写代码、发邮件等） | read + write + execute |
+| 检查者（Checker） | 验证执行者的输出是否满足用户需求 | read + validate + inspect |
+
+### 工作流程
+
+1. 执行者创建 fiber 开始任务
+2. 执行者完成任务后，L3 大脑调用 `POST /admin/fiber/check` 创建检查任务
+3. 检查者通过只读工具验收结果
+4. **通过** → commit 检查任务，undo_log 合并到执行者 fiber
+5. **不通过** → fail 检查任务，触发执行者 fiber 级联回滚（自动撤销所有操作）
+
+### 三层验证模式
+
+```yaml
+validation:
+  mode: adaptive              # off | conservative | adaptive
+  confidence_threshold: 0.7   # 仅 adaptive 模式
+  checker_agent: hermes-checker
+  max_retries: 2
+```
+
+| 模式 | 行为 |
+|------|------|
+| `off` | 不检查任何任务（最快，调试用） |
+| `conservative` | 检查所有 write/destructive 操作（最安全） |
+| `adaptive` | 只检查置信度低于阈值的任务（默认） |
+
+### 逆栈覆盖
+
+检查不通过时，自动触发执行者的逆栈回滚。例如检查者发现"执行者发了邮件但收件人错了"，只需 fail 检查任务，触发执行者的逆栈，自动撤回邮件。检查者本身不负责修复，只负责验收。
 
 ## 部署
 

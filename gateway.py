@@ -33,6 +33,9 @@ API 端点:
   POST /admin/fiber/{id}/fail    → 失败 fiber：级联回滚子孙
   POST /admin/fiber/{id}/commit  → 提交 fiber：合并 undo 到父节点
   GET  /admin/fiber/tree         → 查看 fiber 森林
+  GET  /admin/agents/declaration → 返回智能体声明配置（agents 段）
+  GET  /admin/agents/status      → 返回所有声明 Agent 的存活状态
+  POST /admin/fiber/check        → 创建检查任务 fiber（执行者-检查者模式）
 """
 import datetime
 import json
@@ -224,6 +227,7 @@ class Fiber:
     """任务光纤。每棵 fiber 树对应一个统筹 Agent 的任务。
     - 子 fiber 失败时级联回滚祖先
     - undo_log 是 fiber 本地逆栈，提交时合并到父 fiber 或全局栈
+    - capabilities 声明此 fiber 的权限（执行者: write/execute, 检查者: read/validate/inspect）
     """
     id: int
     parent_id: int | None
@@ -232,15 +236,22 @@ class Fiber:
     status: str = "active"       # active | committed | failed
     undo_log: list = dataclasses.field(default_factory=list)  # [(desc, callable), ...]
     children: list = dataclasses.field(default_factory=list)  # [fiber_id, ...]
+    capabilities: list = dataclasses.field(default_factory=list)  # ["read", "write", "validate", "inspect", "execute"]
     created_at: float = dataclasses.field(default_factory=time.time)
 
-def fiber_create(agent_id, description, parent_id=None):
-    """创建新 fiber。返回 fiber_id。"""
+def fiber_create(agent_id, description, parent_id=None, capabilities=None):
+    """创建新 fiber。返回 fiber_id。
+    capabilities 可选，用于执行者-检查者权限校验：
+    - 检查者只能有 read/validate/inspect
+    - 执行者可以有 write/execute
+    """
     global _next_fiber_id
     with _lock:
         _next_fiber_id += 1
         fid = _next_fiber_id
         f = Fiber(id=fid, parent_id=parent_id, agent_id=agent_id, description=description)
+        if capabilities:
+            f.capabilities = capabilities
         _fibers[fid] = f
         if parent_id is not None and parent_id in _fibers:
             _fibers[parent_id].children.append(fid)
@@ -256,8 +267,10 @@ def fiber_register(fiber_id, description, revert_callable):
     f.undo_log.append((description, revert_callable))
     return True
 
-def fiber_fail(fiber_id):
+def fiber_fail(fiber_id, cascade_parent=True):
     """失败 fiber：LIFO 回滚自己的 undo_log，然后递归失败所有子 fiber。
+    若 cascade_parent=True 且此 fiber 有父节点，级联失败父 fiber（执行者-检查者模式：
+    检查者不通过 → 自动回滚执行者所有操作）。
     返回 (ok, 操作列表)。
     """
     f = _fibers.get(fiber_id)
@@ -265,7 +278,7 @@ def fiber_fail(fiber_id):
         return False, []
     # 先递归失败子 fiber
     for child_id in list(f.children):
-        fiber_fail(child_id)
+        fiber_fail(child_id, cascade_parent=False)
     # LIFO 回滚自己的 undo_log
     ops = []
     while f.undo_log:
@@ -276,6 +289,12 @@ def fiber_fail(fiber_id):
         except Exception as e:
             ops.append(f"回滚失败 ({desc}): {e}")
     f.status = "failed"
+    # 级联失败父 fiber（检查者不通过 → 执行者回滚）
+    if cascade_parent and f.parent_id is not None and f.parent_id in _fibers:
+        parent = _fibers[f.parent_id]
+        if parent.status == "active":
+            _, parent_ops = fiber_fail(f.parent_id, cascade_parent=False)
+            ops.extend(parent_ops)
     return True, ops
 
 def fiber_commit(fiber_id):
@@ -893,13 +912,41 @@ def create_app(cfg):
     @app.post("/admin/fiber/create")
     async def admin_fiber_create(request: Request):
         body = await request.json()
+        # 校验 capabilities（检查者只能有只读权限）
+        capabilities = body.get("capabilities", [])
+        valid_read = {"read", "validate", "inspect"}
+        valid_write = {"write", "execute"}
+        agent_id = body.get("agent_id", "unknown")
+        for cap in capabilities:
+            if cap not in valid_read | valid_write:
+                raise HTTPException(status_code=422, detail=f"无效能力: {cap}")
+
+        # 根据 agent 声明校验权限
+        agents_cfg = cfg.get("agents", [])
+        agent_decl = next((a for a in agents_cfg if a.get("id") == agent_id), None)
+        if agent_decl:
+            declared_caps = set(agent_decl.get("capabilities", []))
+            requested_caps = set(capabilities)
+            if requested_caps - declared_caps:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Agent {agent_id} 声明的能力 ({declared_caps}) 不包含请求的 ({requested_caps})",
+                )
+            # 检查者不能有写权限
+            if declared_caps <= valid_read and requested_caps & valid_write:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"检查者 Agent {agent_id} 只允许 {valid_read} 能力，不能请求 {requested_caps & valid_write}",
+                )
+
         fid = fiber_create(
-            agent_id=body.get("agent_id", "unknown"),
+            agent_id=agent_id,
             description=body.get("description", ""),
             parent_id=body.get("parent_id"),
+            capabilities=capabilities,
         )
         f = _fibers[fid]
-        return {"fiber_id": fid, "parent_id": f.parent_id, "status": f.status, "description": f.description}
+        return {"fiber_id": fid, "parent_id": f.parent_id, "status": f.status, "description": f.description, "capabilities": capabilities}
 
     @app.post("/admin/fiber/{fiber_id}/fail")
     async def admin_fiber_fail(fiber_id: int):
@@ -927,9 +974,159 @@ def create_app(cfg):
                 "status": f.status,
                 "undo_count": len(f.undo_log),
                 "children": sorted(f.children),
+                "capabilities": f.capabilities,
                 "created_at": datetime.datetime.fromtimestamp(f.created_at).isoformat(),
             }
         return {"fibers": {fid: _serialize(f) for fid, f in sorted(_fibers.items())}}
+
+    # ── 智能体声明式接入 ──
+    @app.get("/admin/agents/declaration")
+    async def admin_agents_declaration():
+        """返回 gateway.yaml 中 agents 段的完整声明。
+        智能体启动时调用此端点，根据自身 id 找到对应配置块，自动接入。
+        """
+        agents = cfg.get("agents", {})
+        if not agents:
+            return {"agents": []}
+        return {"agents": agents}
+
+    @app.get("/admin/agents/status")
+    async def admin_agents_status():
+        """探测所有声明 Agent 的存活状态。
+        根据 type 使用不同探测方式：
+        - openhands: 检查 workspace 下是否有锁文件或 PID
+        - astrbot: GET base_url/health，超时 2s
+        - generic: 检查 pid_file 是否存在且进程存活
+        """
+        agents = cfg.get("agents", [])
+        results = []
+        for agent in agents:
+            aid = agent.get("id", "unknown")
+            atype = agent.get("type", "generic")
+            status = "unknown"
+            detail = ""
+
+            try:
+                if atype == "openhands":
+                    ws = agent.get("workspace", "")
+                    # 检查锁文件或 PID 文件
+                    lock_file = os.path.join(ws, ".openhands.lock") if ws else ""
+                    if lock_file and os.path.exists(lock_file):
+                        with open(lock_file) as f:
+                            pid = f.read().strip()
+                        status = "online" if pid and os.path.exists(f"/proc/{pid}") else "offline"
+                        detail = f"lock_pid={pid}" if status == "online" else "lock_stale"
+                    else:
+                        status = "offline"
+                        detail = "no_lock_file"
+
+                elif atype == "astrbot":
+                    base_url = agent.get("base_url", "")
+                    if base_url:
+                        import httpx
+                        try:
+                            async with httpx.AsyncClient(timeout=2) as client:
+                                resp = await client.get(f"{base_url}/health")
+                                status = "online" if resp.status_code < 500 else "degraded"
+                                detail = f"http_{resp.status_code}"
+                        except (httpx.TimeoutException, httpx.ConnectError) as e:
+                            status = "offline"
+                            detail = str(e)[:50]
+                    else:
+                        status = "offline"
+                        detail = "no_base_url"
+
+                elif atype == "generic":
+                    pid_file = agent.get("pid_file", "")
+                    if pid_file and os.path.exists(pid_file):
+                        with open(pid_file) as f:
+                            pid = f.read().strip()
+                        if pid and pid.isdigit():
+                            status = "online" if os.path.exists(f"/proc/{pid}") else "offline"
+                            detail = f"pid={pid}" if status == "online" else "pid_stale"
+                        else:
+                            status = "offline"
+                            detail = "invalid_pid_file"
+                    else:
+                        status = "offline"
+                        detail = "no_pid_file"
+
+                else:
+                    status = "unknown"
+                    detail = f"unsupported_type:{atype}"
+
+            except Exception as e:
+                status = "error"
+                detail = str(e)[:50]
+
+            results.append({
+                "id": aid,
+                "type": atype,
+                "status": status,
+                "detail": detail,
+                "capabilities": agent.get("capabilities", []),
+            })
+
+        return {"agents": results}
+
+    # ── 执行者-检查者模式：创建检查任务 fiber ──
+    @app.post("/admin/fiber/check")
+    async def admin_fiber_check(request: Request):
+        """创建检查任务 fiber。
+        执行者完成任务后，L3 大脑调用此端点创建检查任务。
+        检查者通过只读工具验收结果：
+        - 通过 → commit 检查任务，undo_log 合并到执行者 fiber
+        - 不通过 → fail 检查任务，触发执行者 fiber 级联回滚
+
+        请求体:
+        {
+            "executor_fiber_id": 1,       # 执行者的 fiber ID
+            "checker_agent_id": "hermes-checker",
+            "description": "检查邮件发送结果",
+            "validation_mode": "adaptive",  # off | conservative | adaptive
+            "confidence": 0.6               # 仅 adaptive 使用
+        }
+        """
+        body = await request.json()
+        executor_fiber_id = body.get("executor_fiber_id")
+        checker_agent_id = body.get("checker_agent_id", "checker")
+        description = body.get("description", "检查任务")
+        validation_mode = body.get("validation_mode", "adaptive")
+        confidence = body.get("confidence", 1.0)
+
+        # 校验执行者 fiber 存在
+        if executor_fiber_id is not None and executor_fiber_id not in _fibers:
+            raise HTTPException(status_code=404, detail=f"executor fiber {executor_fiber_id} not found")
+
+        # 根据 validation mode 判断是否需要检查
+        need_check = True
+        if validation_mode == "off":
+            need_check = False
+        elif validation_mode == "adaptive":
+            threshold = cfg.get("validation", {}).get("confidence_threshold", 0.7)
+            need_check = confidence < threshold
+
+        if not need_check:
+            return {
+                "check_fiber_id": None,
+                "skipped": True,
+                "reason": f"validation_mode={validation_mode}, confidence={confidence}",
+            }
+
+        # 创建检查任务 fiber，挂在执行者 fiber 下
+        check_fid = fiber_create(
+            agent_id=checker_agent_id,
+            description=f"[检查] {description}",
+            parent_id=executor_fiber_id,
+        )
+
+        return {
+            "check_fiber_id": check_fid,
+            "skipped": False,
+            "executor_fiber_id": executor_fiber_id,
+            "description": f"[检查] {description}",
+            "status": "active",
+        }
 
     # MCP toggle 的 fiber 感知版本
     @app.post("/admin/mcp/toggle")
