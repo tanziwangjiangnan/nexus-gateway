@@ -67,6 +67,7 @@ python3 gateway.py git-diff           # 未提交的配置变更
 | `GET /health` | 健康检查（免鉴权） |
 | `GET /chat` | 聊天页面（免鉴权） |
 | `POST /v1/chat/completions` | OpenAI 兼容推理（支持 `api_key` 字段透传自定义 Key） |
+| `POST /v1/plugins/{id}/call` | 统一插件调用：capabilities 校验 + 审批缓存 + Fiber 逆操作 |
 | `GET /v1/models` | 模型目录 |
 | `GET /metrics` | Prometheus 指标 |
 | `GET /admin/pools` | 池/provider 状态 |
@@ -230,6 +231,55 @@ curl 'http://127.0.0.1:8646/admin/logs?lines=50'
 
 网关自动收集检查者自身的日志并附在失败报告中，让问题定位一目了然。
 
+## 统一插件调用
+
+所有智能体通过 `POST /v1/plugins/{id}/call` 统一调用插件，网关根据 `execution` 模式适配。
+
+### 插件声明
+
+在 `gateway.yaml` 的 `plugins` 段声明：
+
+```yaml
+plugins:
+  - id: web_search
+    display_name: "联网搜索"
+    provider: tavily-connector
+    execution: http                              # http | cli
+    endpoint: https://api.tavily.com/search
+    input_schema: { query: string, max_results: integer }
+    capabilities: [read]                         # 调用者需有此能力
+    timeout: 30
+    concurrent: true
+
+  - id: send_email
+    display_name: "发送邮件"
+    provider: hermes-smtp
+    execution: cli
+    command: python3 /opt/hermes/smtp.py --to "{to}" --subject "{subject}" --body "{body}"
+    input_schema: { to: string, subject: string, body: string }
+    inverse: recall_email                        # 逆操作（Fiber 回滚时自动调用）
+    capabilities: [write, destructive]
+    timeout: 30
+    concurrent: false
+```
+
+### 调用方式
+
+```bash
+curl -X POST http://127.0.0.1:8646/v1/plugins/web_search/call \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id":"openhands","params":{"query":"today news","max_results":5}}'
+```
+
+### 安全保障
+
+| 机制 | 说明 |
+|------|------|
+| Capabilities 校验 | 调用者必须拥有插件所需的能力（如 write 插件拒绝 read-only agent） |
+| 审批缓存 | 键 `(agent_id, plugin_id, params)`，5 分钟内重复调用免审 |
+| Fiber 逆操作 | 成功调用注册逆操作到 Fiber 树，`POST /admin/fiber/{id}/fail` 自动回滚 |
+| 无 fallback | Provider 不可达时直接返回错误，不触发故障转移 |
+
 ## 部署
 
 ```bash
@@ -267,4 +317,5 @@ SIGHUP 热加载：自动 git commit 快照 + 清空运行时状态 + 重启生�
 | v2.5 | 智能体声明式接入，`/admin/agents/declaration` + `/admin/agents/status` | 2026-08-25 |
 | v2.5 | `scan-agents` 自动发现：扫描目录→交互确认→写入 YAML→热加载 | 2026-08-25 |
 | v2.5 | 日志聚合 `/admin/logs`：统一读取所有 Agent 日志，按时间合并，level/agent 过滤 | 2026-08-25 |
+| v2.5 | 统一插件调用 `POST /v1/plugins/{id}/call`：capabilities 校验 + 审批缓存 + Fiber 逆操作 | 2026-08-25 |
 | v2.6 | 执行者-检查者模式：`/admin/fiber/check`，级联回滚，capabilities 权限校验，检查者证据 | 2026-08-25 |

@@ -22,6 +22,7 @@ API 端点:
   GET  /chat                    → 聊天页面（免鉴权，自备 Key）
   GET  /v1/models                → 模型目录（含池/provider/健康/用量）
   POST /v1/chat/completions      → OpenAI 兼容，三池路由 + 自定义 Key
+  POST /v1/plugins/{id}/call     → 统一插件调用：capabilities 校验 + 审批缓存 + Fiber 逆操作
   GET  /health                   → 网关自身健康检查
   GET  /metrics                  → Prometheus 指标
   GET  /admin/pools              → 查看各池/provider 状态
@@ -358,6 +359,15 @@ def _log_matches(entry: dict, filter_levels: list[str], since_str: str) -> bool:
         return False
     return True
 
+def _format_string(template: str, params: dict) -> str:
+    """替换模板字符串中的 {key} 占位符为 params 中的值。"""
+    import re
+    def _replacer(m):
+        key = m.group(1)
+        val = params.get(key, m.group(0))
+        return str(val) if val is not None else m.group(0)
+    return re.sub(r'\{(\w+)\}', _replacer, template)
+
 # ── 路由引擎 ──
 
 def find_model_config(cfg, model):
@@ -522,6 +532,8 @@ def create_app(cfg):
     @app.middleware("http")
     async def auth_check(request: Request, call_next):
         if request.url.path in ("/health", "/metrics", "/chat"):
+            return await call_next(request)
+        if request.url.path.startswith("/v1/plugins/"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         expected = f"Bearer {cfg['gateway_key']}"
@@ -1392,6 +1404,173 @@ def create_app(cfg):
             "cached": cached,
             "agent_id": agent_id,
             "fiber_id": fiber_id,
+        }
+
+    # ── 统一插件调用 /v1/plugins/{id}/call ──
+    @app.post("/v1/plugins/{plugin_id}/call")
+    async def v1_plugins_call(plugin_id: str, request: Request):
+        """统一插件调用入口。所有智能体通过此端点调用插件。
+        网关根据 execution 模式适配（http/cli），结果通过 Fiber 树可逆。
+        """
+        body = await request.json()
+        agent_id = body.get("agent_id", "unknown")
+        params = body.get("params", {})
+        fiber_id = body.get("fiber_id")  # optional: 挂到现有 fiber 下
+        reason = body.get("reason", "")
+
+        # 1. 查找插件
+        plugins = cfg.get("plugins", [])
+        plugin = next((p for p in plugins if p["id"] == plugin_id), None)
+        if not plugin:
+            raise HTTPException(status_code=404, detail=f"plugin '{plugin_id}' not found")
+
+        # 2. 校验 capabilities（调用者必须有插件所需的能力）
+        plugin_caps = set(plugin.get("capabilities", []))
+        agent_caps = set()
+        if plugin_caps:
+            # 查找调用者声明的 capabilities
+            if "caller" in body:
+                agent_caps = set(body["caller"].get("capabilities", []))
+            else:
+                # 从 agents 声明中查找
+                agents_cfg = cfg.get("agents", [])
+                caller_cfg = next((a for a in agents_cfg if a.get("id") == agent_id), None)
+                if caller_cfg:
+                    agent_caps = set(caller_cfg.get("capabilities", []))
+            if not agent_caps:
+                # 未知调用者，只允许 read 插件
+                if plugin_caps - {"read"}:
+                    raise HTTPException(status_code=403,
+                        detail=f"unknown agent '{agent_id}' cannot call plugin with capabilities: {plugin_caps}")
+            else:
+                missing = plugin_caps - agent_caps
+                if missing:
+                    raise HTTPException(status_code=403,
+                        detail=f"agent '{agent_id}' missing capabilities: {missing}")
+
+        # 3. 审批缓存：键为 (agent_id, plugin_id, action)
+        action_body = {}
+        for k, v in params.items():
+            action_body[k] = v
+        import hashlib
+        action_hash = hashlib.md5(f"{agent_id}:{plugin_id}:{json.dumps(action_body, sort_keys=True)}".encode()).hexdigest()
+        now = time.time()
+        cached = action_hash in _approval_cache and _approval_cache[action_hash] > now
+        if not cached:
+            _approval_cache[action_hash] = now + _APPROVAL_TTL
+
+        # 4. 创建 fiber 子任务
+        timeout = plugin.get("timeout", 30)
+        concurrent = plugin.get("concurrent", False)
+        fid = fiber_create(
+            agent_id=agent_id,
+            description=f"[插件] {plugin.get('display_name', plugin_id)}",
+            parent_id=fiber_id,
+            capabilities=list(agent_caps) if agent_caps else None,
+        )
+
+        # 5. 执行插件
+        exec_mode = plugin.get("execution", "http")
+        result = {}
+        error = None
+
+        try:
+            if exec_mode == "http":
+                endpoint = plugin.get("endpoint", "")
+                if not endpoint:
+                    raise HTTPException(status_code=500, detail=f"plugin '{plugin_id}' has no endpoint")
+                # 替换 params 中的占位符
+                call_url = _format_string(endpoint, params)
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(call_url, json=params)
+                    if resp.status_code >= 400:
+                        error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                    else:
+                        result = resp.json()
+
+            elif exec_mode == "cli":
+                command = plugin.get("command", "")
+                if not command:
+                    raise HTTPException(status_code=500, detail=f"plugin '{plugin_id}' has no command")
+                # 替换参数占位符
+                cmd = _format_string(command, params)
+                import subprocess
+                try:
+                    ret = subprocess.run(
+                        cmd, shell=True, capture_output=True, text=True, timeout=timeout
+                    )
+                    if ret.returncode != 0:
+                        error = f"CLI exit {ret.returncode}: {ret.stderr[:200] or ret.stdout[:200]}"
+                    else:
+                        # 尝试解析 stdout 为 JSON，否则用纯文本
+                        try:
+                            result = json.loads(ret.stdout)
+                        except json.JSONDecodeError:
+                            result = {"stdout": ret.stdout.strip(), "stderr": ret.stderr.strip()}
+                except subprocess.TimeoutExpired:
+                    error = f"CLI timeout after {timeout}s"
+            else:
+                error = f"unsupported execution mode: {exec_mode}"
+
+        except httpx.TimeoutException:
+            error = f"HTTP timeout after {timeout}s"
+        except httpx.ConnectError:
+            error = f"provider {plugin.get('provider', 'unknown')} unreachable"
+        except Exception as e:
+            error = str(e)
+
+        # 6. 注册逆操作（如果插件失败，不注册逆操作，Fiber fail 只需回滚自己）
+        if error:
+            # 失败：fail 此 fiber
+            fiber_fail(fid, cascade_parent=False)
+            return {
+                "plugin_id": plugin_id,
+                "status": "error",
+                "error": error,
+                "fiber_id": fid,
+                "cached": cached,
+            }
+
+        # 成功：注册逆操作
+        inverse_id = plugin.get("inverse")
+        if inverse_id:
+            # 注册撤销：调用逆插件
+            def _make_inverse(pid, p, aid):
+                def _inverse():
+                    # 查找逆插件
+                    inv_plugin = next((pl for pl in cfg.get("plugins", []) if pl["id"] == pid), None)
+                    if not inv_plugin:
+                        return
+                    inv_exec = inv_plugin.get("execution", "http")
+                    inv_params = {"_original_result": result, **p}
+                    if inv_exec == "http":
+                        inv_url = _format_string(inv_plugin.get("endpoint", ""), inv_params)
+                        import httpx
+                        import asyncio
+                        try:
+                            asyncio.run(httpx.AsyncClient(timeout=10).post(inv_url, json=inv_params))
+                        except Exception:
+                            pass
+                    elif inv_exec == "cli":
+                        inv_cmd = _format_string(inv_plugin.get("command", ""), inv_params)
+                        import subprocess
+                        try:
+                            subprocess.run(inv_cmd, shell=True, capture_output=True, timeout=10)
+                        except Exception:
+                            pass
+                return _inverse
+            fiber_register(fid, f"逆操作: {plugin.get('display_name', plugin_id)} 调用 {inverse_id}",
+                           _make_inverse(inverse_id, params, agent_id))
+
+        # 提交 fiber（合并到父或全局栈）
+        fiber_commit(fid)
+
+        return {
+            "plugin_id": plugin_id,
+            "status": "ok",
+            "result": result,
+            "fiber_id": fid,
+            "cached": cached,
         }
 
     return app
