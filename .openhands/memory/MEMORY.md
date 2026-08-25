@@ -3,7 +3,8 @@
 ## 架构
 - 三资源池路由（pool_a/b/c），池内权重轮询，池间故障转移
 - 三层逆栈：Git 配置层 → 运行时 undo_stack → Fiber 任务树
-- 代码 ~870 行（v2.4），~1100 行（v2.6），内存 ~48MB
+- 代码 ~870 行（v2.4），~1100 行（v2.6），~1200 行（v2.9），内存 ~48MB
+- `/v1/models` 实时状态：`status` 来自 `_disabled_providers` + 错误率，`capabilities` 来自 YAML provider 声明
 
 ## 用户关键决策
 - 方案 C（自己写网关），所有智能体平等消费独立模型池网关
@@ -15,12 +16,16 @@
 - v2.4: Fiber 树形上下文（子任务级联回滚，undo 合并）
 - v2.5: 聊天页面 /chat + 智能体声明式接入 + scan-agents 自动发现 + 日志聚合 /admin/logs
 - v2.6: 执行者-检查者模式（/admin/fiber/check，级联回滚，capabilities 权限校验，检查者证据）
+- v2.7: 重复调用拦截（call_history 自底向上遍历）+ 动态校验（output_schema Schema 校验 + 熔断联动）
+- v2.8: 跨分支全局去重（`_global_call_history` + 三层清理）+ 插件排队（serial/throttle 并发控制）
+- v2.9: 模型状态扩展：`/v1/models` 返回 `status`/`capabilities`/`error_rate`，熔断状态实时同步
 
 ## 关键命令
 - `python3 gateway.py scan-agents` — 自动发现并接入智能体
 - `python3 gateway.py sync-runtime` — 热加载配置（SIGHUP）
 - `python3 gateway.py fiber` — 查看 Agent 任务树
 - `systemctl reload gateway` — 配置热加载
+- `journalctl -u gateway --no-pager -n 50` — 查看网关日志
 
 ## 外部域名
 - `hermes.jiangnande.cloud:8648` → 网关（三池路由），阿里云安全组已开
@@ -32,6 +37,10 @@
 - **执行模式**: `http`（转发到 endpoint）或 `cli`（subprocess，超时 30s）
 - **Capabilities 校验**: 调用者必须拥有插件声明的所有能力，否则 403
 - **Fiber 集成**: 成功调用注册逆操作到 Fiber 树，`fiber_fail` 自动回滚
+- **跨分支全局去重（v2.8）**: `_global_call_history` 全局 dict，key=`{plugin_id}:{params_hash}`，24h TTL，三层清理（主动/fiber commit/fail → 定时/1h → 惰性/查询时）
+- **插件排队（v2.8）**: 字段 `concurrency`（parallel/serial/throttle）+ `resource_lock_key`（串行锁分组）+ `throttle_limit`（每秒上限）
+- **动态校验（v2.7）**: 执行后创建 `[校验]` 子 fiber，`output_schema` 字段名/类型校验，失败级联回滚父 fiber
+- **熔断联动（v2.7）**: HTTP ConnectError 自动标记 provider 不可达
 - **无 fallback**: 插件不可达时直接返回错误
 - **占位符**: `_format_string()` 支持 `{key}` 替换，用于 CLI 命令模板
 

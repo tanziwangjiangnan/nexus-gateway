@@ -822,9 +822,66 @@ def create_app(cfg):
                                FROM registry r LEFT JOIN usage u ON u.model=r.model
                                GROUP BY r.model ORDER BY r.pool, r.model""").fetchall()
         conn.close()
-        data = [{"id": r["model"], "object": "model", "pool": r["pool"],
-                 "provider": r["provider"], "tier": r["tier"],
-                 "status": r["status"], "today_tokens": r["tokens"]} for r in rows]
+
+        # 计算每个 provider 最近 5 分钟的错误率
+        conn2 = get_db()
+        err_rows = conn2.execute("""
+            SELECT provider,
+                   COUNT(*) as total,
+                   SUM(ok) as success
+            FROM usage
+            WHERE called_at > datetime('now', '-5 minutes')
+            GROUP BY provider
+        """).fetchall()
+        conn2.close()
+        provider_errors = {}
+        for r in err_rows:
+            total = r["total"]
+            if total >= 5:
+                success = r["success"] or 0
+                provider_errors[r["provider"]] = 1.0 - (success / total)
+
+        # 构建 provider → capabilities 映射
+        provider_caps = {}
+        for pool_name, pool_cfg in cfg.get("pools", {}).items():
+            for pv in pool_cfg.get("providers", []):
+                caps = pv.get("capabilities", [])
+                if caps:
+                    provider_caps[pv["name"]] = caps
+
+        data = []
+        seen = set()
+        for r in rows:
+            model_id = r["model"]
+            if model_id in seen:
+                continue
+            seen.add(model_id)
+            provider_name = r["provider"]
+            err_rate = provider_errors.get(provider_name, 0.0)
+
+            # 实时状态：熔断覆盖 DB 状态
+            if provider_name in _disabled_providers:
+                model_status = "disabled"
+            elif err_rate > 0.20:
+                model_status = "throttled"
+            else:
+                model_status = "active"
+
+            entry = {
+                "id": model_id,
+                "object": "model",
+                "pool": r["pool"],
+                "provider": provider_name,
+                "tier": r["tier"],
+                "status": model_status,
+                "error_rate": round(err_rate, 3) if err_rate > 0 else None,
+                "today_tokens": r["tokens"],
+            }
+            caps = provider_caps.get(provider_name, [])
+            if caps:
+                entry["capabilities"] = caps
+            data.append(entry)
+
         return {"object": "list", "data": data}
 
     # ── 聊天补全（三池路由核心） ──

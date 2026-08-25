@@ -68,7 +68,7 @@ python3 gateway.py git-diff           # 未提交的配置变更
 | `GET /chat` | 聊天页面（免鉴权） |
 | `POST /v1/chat/completions` | OpenAI 兼容推理（支持 `api_key` 字段透传自定义 Key） |
 | `POST /v1/plugins/{id}/call` | 统一插件调用：capabilities 校验 + 审批缓存 + Fiber 逆操作 + 重复调用拦截 + 动态 Schema 校验 |
-| `GET /v1/models` | 模型目录 |
+| `GET /v1/models` | 模型目录 — 含实时状态、能力标签、错误率（详见下文） |
 | `GET /metrics` | Prometheus 指标 |
 | `GET /admin/pools` | 池/provider 状态 |
 | `POST /admin/pools/{pool}/providers/{provider}/toggle` | 手动启停 provider |
@@ -85,6 +85,32 @@ python3 gateway.py git-diff           # 未提交的配置变更
 | `GET /admin/agents/declaration` | 返回智能体声明配置 + 可用插件列表（支持 `?agent_id=xxx` 过滤） |
 | `GET /admin/agents/status` | 返回所有声明 Agent 的存活状态 |
 | `GET /admin/logs` | 聚合所有 Agent 日志，按时间合并，支持 level/agent 过滤 |
+
+### `/v1/models` 返回格式
+
+```json
+{
+  "data": [
+    {
+      "id": "DeepSeek-V4-Flash",
+      "object": "model",
+      "pool": "pool_a",
+      "provider": "scnet-tp",
+      "tier": "A",
+      "status": "active",
+      "error_rate": null,
+      "today_tokens": 0,
+      "capabilities": ["code", "chat", "reasoning"]
+    }
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `status` | `string` | `active` / `disabled`（被熔断禁用）/ `throttled`（错误率 >20% 临时限流） |
+| `capabilities` | `array`（可选） | 能力标签（来自 YAML 中 provider 声明） |
+| `error_rate` | `float\|null` | 最近 5 分钟错误率，`null` 表示样本不足或无错误 |
 
 ## 配置
 
@@ -384,3 +410,4 @@ SIGHUP 热加载：自动 git commit 快照 + 清空运行时状态 + 重启生�
 | v2.6 | 执行者-检查者模式：`/admin/fiber/check`，级联回滚，capabilities 权限校验，检查者证据 | 2026-08-25 |
 | v2.7 | 三池层级关系确认 + 重复调用拦截 + 工具调用级动态校验（Schema 校验 + 熔断联动） | 2026-08-25 |
 | v2.8 | 跨分支全局去重（Root 级 `_global_call_history` + 三层清理）+ 插件排队（serial/throttle 并发控制） | 2026-08-25 |
+| v2.9 | 模型状态扩展：`/v1/models` 返回 `status`/`capabilities`/`error_rate`，熔断状态实时同步 | 2026-08-25 |
