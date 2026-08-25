@@ -19,10 +19,13 @@ curl http://127.0.0.1:8646/health
 ## 三行架构
 
 ```
-请求(model=代码生成) → 关键词匹配 → pool_a
-  → pool_a: scnet-tp(权重5) / xiaomi(权重2) / deepseek-direct(权重1)
-  → 故障转移: 5xx/超时/连接失败 → pool_b → pool_c
+请求 → ①关键词匹配 → ②模型名精确匹配 → ③默认池
+  → 选中池: pool_a/pool_b/pool_c
+  → 池内权重轮询: scnet-tp(5) / xiaomi(2) / deepseek-direct(1)
+  → 故障转移: 5xx/超时/连接失败 → 下一个池 (pool_a→pool_b→pool_c)
   → 全部失败 → 返回 503
+  → 4xx/422 客户端错误 → 直接返回，不触发故障转移
+  → 429 限流 → 直接返回，不触发故障转移
 ```
 
 - **池内**：权重轮询（支持动态权重，按错误率自动缩放）
@@ -69,15 +72,17 @@ python3 gateway.py git-diff           # 未提交的配置变更
 | `GET /admin/pools` | 池/provider 状态 |
 | `POST /admin/pools/{pool}/providers/{provider}/toggle` | 手动启停 provider |
 | `POST /admin/mcp/toggle` | Agent 调用 toggle（走审批缓存 + fiber） |
+| `GET /admin/mcp/approvals` | 查看审批缓存 |
 | `GET /admin/mcp/status` | 熔断 + 权重 + 错误率总览 |
 | `POST /admin/fiber/create` | 创建 Agent 任务树节点 |
 | `POST /admin/fiber/{id}/fail` | 失败/级联回滚 |
 | `POST /admin/fiber/{id}/commit` | 提交/合并 undo |
+| `GET /admin/fiber/tree` | 查看 fiber 森林 |
+| `POST /admin/fiber/check` | 创建检查任务 fiber（执行者-检查者模式） |
 | `GET /admin/undo` | 撤销上一条运行时操作 |
 | `GET /admin/undo-list` | 查看运行时逆栈 |
 | `GET /admin/agents/declaration` | 返回智能体声明配置（agents 段） |
 | `GET /admin/agents/status` | 返回所有声明 Agent 的存活状态 |
-| `POST /admin/fiber/check` | 创建检查任务 fiber（执行者-检查者模式） |
 | `GET /admin/logs` | 聚合所有 Agent 日志，按时间合并，支持 level/agent 过滤 |
 
 ## 配置
