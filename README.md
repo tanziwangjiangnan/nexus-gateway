@@ -311,6 +311,36 @@ curl -X POST http://127.0.0.1:8646/v1/plugins/web_search/call \
 | Fiber 逆操作 | 成功调用注册逆操作到 Fiber 树，`POST /admin/fiber/{id}/fail` 自动回滚 |
 | 无 fallback | Provider 不可达时直接返回错误，不触发故障转移 |
 
+### 重复检测机制（v2.8）
+
+所有调用在进入执行前，先查询 Root 级全局去重表 `_global_call_history`。若同一 `(plugin_id, params_hash)` 在 24 小时内已成功执行，则直接返回 `duplicate_call_detected`，不执行实际调用。
+
+**存储与清理策略**：
+
+| 层级 | 触发时机 | 作用 |
+|------|---------|------|
+| 主动清理 | Fiber commit/fail 时 | 该 fiber 子树的所有条目从全局表删除 |
+| 定时清理 | 后台线程每 1 小时 | 删除 `timestamp < now - 24h` 的记录 |
+| 惰性清理 | 每次查询时 | 命中记录已超时则删除并视为未命中 |
+
+### 插件排队策略（v2.8）
+
+插件声明中增加 `concurrency` 字段控制并发策略：
+
+```yaml
+plugins:
+  - id: db_write
+    concurrency: serial              # serial | parallel | throttle
+    resource_lock_key: "db_table"    # serial 模式下按此 key 分组锁
+    throttle_limit: 5                # throttle 模式下每秒最大请求数
+```
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| `parallel` | 无限制并发（默认） | 读操作、查询 |
+| `serial` | 按 `resource_lock_key` 分组，同一 key 串行 | 写操作、修改同一文件 |
+| `throttle` | 每秒限制 `throttle_limit` 次 | 外部 API 调用 |
+
 ## 部署
 
 ```bash
@@ -353,3 +383,4 @@ SIGHUP 热加载：自动 git commit 快照 + 清空运行时状态 + 重启生�
 | v2.5 | `scan-agents` 自动发现 `plugins.yaml`：Agent 目录下插件清单自动声明 | 2026-08-25 |
 | v2.6 | 执行者-检查者模式：`/admin/fiber/check`，级联回滚，capabilities 权限校验，检查者证据 | 2026-08-25 |
 | v2.7 | 三池层级关系确认 + 重复调用拦截 + 工具调用级动态校验（Schema 校验 + 熔断联动） | 2026-08-25 |
+| v2.8 | 跨分支全局去重（Root 级 `_global_call_history` + 三层清理）+ 插件排队（serial/throttle 并发控制） | 2026-08-25 |

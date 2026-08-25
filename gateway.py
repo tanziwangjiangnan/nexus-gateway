@@ -43,6 +43,7 @@ API 端点:
 """
 import datetime
 import hashlib
+import asyncio
 import json
 import os
 import random
@@ -54,6 +55,7 @@ import sys
 import time
 import threading
 import yaml
+import httpx
 
 # ── 路径 ──
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -73,6 +75,12 @@ _pending_approvals = {}         # {action_id: {action, params, agent_id}}
 _fibers = {}                    # {fiber_id: Fiber} — Agent 任务树
 _next_fiber_id = 0
 _lock = threading.Lock()
+_global_call_history = {}       # {f"{plugin_id}:{params_hash}": {"fiber_id": int, "timestamp": float, "result_preview": str}}
+                                # Root 级全局去重表，24h TTL，三层清理
+
+# ── 插件排队机制（v2.8） ──
+_serial_locks = {}              # {resource_lock_key: asyncio.Lock} — 串行锁池
+_throttle_windows = {}          # {plugin_id: [t1, t2, ...]} — 速率限制窗口
 
 # ── 配置加载 ──
 def load_config(path=None):
@@ -326,7 +334,123 @@ def fiber_commit(fiber_id):
         _undo_stack.extend(f.undo_log)
     f.undo_log.clear()
     f.status = "committed"
+    # 主动清理：该 fiber 下所有 call_history 条目从全局表删除
+    _cleanup_global_history_for_fiber(fiber_id)
     return True
+
+
+# ── Root 级全局去重表（v2.8） ──
+_GLOBAL_HISTORY_TTL = 86400  # 24 小时
+
+def _global_call_key(plugin_id: str, params_hash: str) -> str:
+    return f"{plugin_id}:{params_hash}"
+
+def _global_call_lookup(plugin_id: str, params_hash: str) -> dict | None:
+    """惰性清理：查找全局去重表，命中但超时则删除并返回 None。"""
+    key = _global_call_key(plugin_id, params_hash)
+    entry = _global_call_history.get(key)
+    if entry is None:
+        return None
+    now = time.time()
+    if now - entry["timestamp"] > _GLOBAL_HISTORY_TTL:
+        del _global_call_history[key]
+        return None
+    return entry
+
+def _global_call_add(plugin_id: str, params_hash: str, fiber_id: int, result_preview: str = ""):
+    """写入全局去重表。"""
+    key = _global_call_key(plugin_id, params_hash)
+    _global_call_history[key] = {
+        "fiber_id": fiber_id,
+        "timestamp": time.time(),
+        "result_preview": result_preview[:200],
+    }
+
+def _global_call_remove(plugin_id: str, params_hash: str):
+    """从全局去重表删除单条记录。"""
+    key = _global_call_key(plugin_id, params_hash)
+    _global_call_history.pop(key, None)
+
+def _cleanup_global_history_for_fiber(fiber_id: int):
+    """主动清理：遍历 fiber 及其子树，删除所有 call_history 对应的全局表条目。"""
+    f = _fibers.get(fiber_id)
+    if not f:
+        return
+    # 清理本 fiber 的 call_history
+    for entry in f.call_history:
+        _global_call_remove(entry["plugin_id"], entry["params_hash"])
+    # 递归清理子 fiber
+    for child_id in list(f.children):
+        _cleanup_global_history_for_fiber(child_id)
+
+def _cleanup_global_history_periodic():
+    """定时清理：后台线程每 1 小时扫描，删除超时条目。"""
+    while True:
+        time.sleep(3600)
+        now = time.time()
+        expired = [k for k, v in _global_call_history.items()
+                   if now - v["timestamp"] > _GLOBAL_HISTORY_TTL]
+        for k in expired:
+            _global_call_history.pop(k, None)
+        if expired:
+            print(f"[全局去重] 定时清理 {len(expired)} 条过期记录")
+
+
+# ── 插件执行器（v2.8 排队用） ──
+async def _execute_plugin(plugin: dict, plugin_id: str, params: dict, timeout: int):
+    """执行插件（http/cli），返回 (result, error)。独立于排队逻辑。"""
+    global _disabled_providers
+    exec_mode = plugin.get("execution", "http")
+    result = {}
+    error = None
+
+    try:
+        if exec_mode == "http":
+            endpoint = plugin.get("endpoint", "")
+            if not endpoint:
+                error = f"plugin '{plugin_id}' has no endpoint"
+                return result, error
+            call_url = _format_string(endpoint, params)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(call_url, json=params)
+                if resp.status_code >= 400:
+                    error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                else:
+                    result = resp.json()
+
+        elif exec_mode == "cli":
+            command = plugin.get("command", "")
+            if not command:
+                error = f"plugin '{plugin_id}' has no command"
+                return result, error
+            cmd = _format_string(command, params)
+            try:
+                ret = subprocess.run(
+                    cmd, shell=True, capture_output=True, text=True, timeout=timeout
+                )
+                if ret.returncode != 0:
+                    error = f"CLI exit {ret.returncode}: {ret.stderr[:200] or ret.stdout[:200]}"
+                else:
+                    try:
+                        result = json.loads(ret.stdout)
+                    except json.JSONDecodeError:
+                        result = {"stdout": ret.stdout.strip(), "stderr": ret.stderr.strip()}
+            except subprocess.TimeoutExpired:
+                error = f"CLI timeout after {timeout}s"
+        else:
+            error = f"unsupported execution mode: {exec_mode}"
+
+    except httpx.TimeoutException:
+        error = f"HTTP timeout after {timeout}s"
+    except httpx.ConnectError:
+        provider_name = plugin.get("provider", "")
+        if provider_name and provider_name not in _disabled_providers:
+            _disabled_providers.add(provider_name)
+        error = f"provider {provider_name} unreachable"
+    except Exception as e:
+        error = str(e)
+
+    return result, error
 
 # ── 日志解析辅助 ──
 _LOG_PATTERN = re.compile(
@@ -527,7 +651,6 @@ def cmd_usage(cfg):
 def create_app(cfg):
     from fastapi import FastAPI, Request, HTTPException
     from fastapi.responses import JSONResponse, StreamingResponse, Response
-    import httpx
 
     app = FastAPI(title="模型池网关 v2", version="0.2.0")
 
@@ -1135,7 +1258,6 @@ def create_app(cfg):
                 elif atype == "astrbot":
                     base_url = agent.get("base_url", "")
                     if base_url:
-                        import httpx
                         try:
                             async with httpx.AsyncClient(timeout=2) as client:
                                 resp = await client.get(f"{base_url}/health")
@@ -1241,7 +1363,6 @@ def create_app(cfg):
                 elif atype == "astrbot":
                     base_url = agent.get("base_url", "")
                     if base_url:
-                        import httpx
                         try:
                             async with httpx.AsyncClient(timeout=5) as client:
                                 resp = await client.get(f"{base_url}/logs")
@@ -1475,17 +1596,32 @@ def create_app(cfg):
                     raise HTTPException(status_code=403,
                         detail=f"agent '{agent_id}' missing capabilities: {missing}")
 
-        # 3. 审批缓存：键为 (agent_id, plugin_id, action)
+        # 3. 审批缓存 + 全局去重 key
         action_body = {}
         for k, v in params.items():
             action_body[k] = v
-        action_hash = hashlib.md5(f"{agent_id}:{plugin_id}:{json.dumps(action_body, sort_keys=True)}".encode()).hexdigest()
+        params_json = json.dumps(action_body, sort_keys=True)
+        action_hash = hashlib.md5(f"{agent_id}:{plugin_id}:{params_json}".encode()).hexdigest()
         now = time.time()
         cached = action_hash in _approval_cache and _approval_cache[action_hash] > now
         if not cached:
             _approval_cache[action_hash] = now + _APPROVAL_TTL
 
-        # 4. 创建 fiber 子任务
+        # 4. 全局去重检测（跨分支，Root 级）
+        params_hash = hashlib.md5(f"{plugin_id}:{params_json}".encode()).hexdigest()
+        global_entry = _global_call_lookup(plugin_id, params_hash)
+        if global_entry:
+            # 重复调用，不执行
+            return {
+                "plugin_id": plugin_id,
+                "status": "duplicate",
+                "error": "duplicate_call_detected",
+                "params_hash": params_hash,
+                "first_executed_at": global_entry.get("timestamp"),
+                "first_fiber_id": global_entry.get("fiber_id"),
+            }
+
+        # 5. 创建 fiber 子任务
         timeout = plugin.get("timeout", 30)
         concurrent = plugin.get("concurrent", False)
         fid = fiber_create(
@@ -1495,87 +1631,42 @@ def create_app(cfg):
             capabilities=list(agent_caps) if agent_caps else None,
         )
 
-        # ── 任务2: 重复调用拦截（循环检测） ──
-        if fiber_id is not None:
-            # 遍历当前 fiber 及其所有父 fiber 的 call_history
-            cursor = _fibers.get(fiber_id)
-            while cursor is not None:
-                for entry in cursor.call_history:
-                    if entry["plugin_id"] == plugin_id and entry["params_hash"] == action_hash:
-                        return {
-                            "plugin_id": plugin_id,
-                            "status": "duplicate",
-                            "error": "duplicate_call_detected",
-                            "params_hash": action_hash,
-                            "fiber_id": fid,
-                            "previous_call_time": entry.get("time"),
-                        }
-                if cursor.parent_id is not None and cursor.parent_id in _fibers:
-                    cursor = _fibers[cursor.parent_id]
-                else:
-                    break
-
         # 记录本次调用到 fiber 的 call_history
-        # 同时记录到父 fiber 上，使父 fiber 能被子树的重复检测发现
-        call_entry = {"plugin_id": plugin_id, "params_hash": action_hash, "time": time.time()}
+        call_entry = {"plugin_id": plugin_id, "params_hash": params_hash, "time": time.time()}
         if fid in _fibers:
             _fibers[fid].call_history.append(call_entry)
         if fiber_id is not None and fiber_id in _fibers:
             _fibers[fiber_id].call_history.append(call_entry)
 
-        # 5. 执行插件
-        exec_mode = plugin.get("execution", "http")
+        # 6. 排队调度 + 执行插件
+        concurrency = plugin.get("concurrency", "parallel")
+        resource_key = plugin.get("resource_lock_key", plugin_id)
+        throttle_limit = plugin.get("throttle_limit", 0)
         result = {}
         error = None
 
-        try:
-            if exec_mode == "http":
-                endpoint = plugin.get("endpoint", "")
-                if not endpoint:
-                    raise HTTPException(status_code=500, detail=f"plugin '{plugin_id}' has no endpoint")
-                # 替换 params 中的占位符
-                call_url = _format_string(endpoint, params)
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.post(call_url, json=params)
-                    if resp.status_code >= 400:
-                        error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                    else:
-                        result = resp.json()
+        if concurrency == "serial" and resource_key:
+            # 串行：按 resource_lock_key 分组加锁
+            if resource_key not in _serial_locks:
+                _serial_locks[resource_key] = asyncio.Lock()
+            lock = _serial_locks[resource_key]
+            async with lock:
+                result, error = await _execute_plugin(plugin, plugin_id, params, timeout)
 
-            elif exec_mode == "cli":
-                command = plugin.get("command", "")
-                if not command:
-                    raise HTTPException(status_code=500, detail=f"plugin '{plugin_id}' has no command")
-                # 替换参数占位符
-                cmd = _format_string(command, params)
-                import subprocess
-                try:
-                    ret = subprocess.run(
-                        cmd, shell=True, capture_output=True, text=True, timeout=timeout
-                    )
-                    if ret.returncode != 0:
-                        error = f"CLI exit {ret.returncode}: {ret.stderr[:200] or ret.stdout[:200]}"
-                    else:
-                        # 尝试解析 stdout 为 JSON，否则用纯文本
-                        try:
-                            result = json.loads(ret.stdout)
-                        except json.JSONDecodeError:
-                            result = {"stdout": ret.stdout.strip(), "stderr": ret.stderr.strip()}
-                except subprocess.TimeoutExpired:
-                    error = f"CLI timeout after {timeout}s"
+        elif concurrency == "throttle" and throttle_limit > 0:
+            # 限流：滑动窗口检查
+            now = time.time()
+            window = _throttle_windows.setdefault(plugin_id, [])
+            _throttle_windows[plugin_id] = [t for t in window if now - t < 1.0]
+            if len(_throttle_windows[plugin_id]) >= throttle_limit:
+                error = f"rate limit exceeded: {throttle_limit}/s"
             else:
-                error = f"unsupported execution mode: {exec_mode}"
+                _throttle_windows[plugin_id].append(now)
+                result, error = await _execute_plugin(plugin, plugin_id, params, timeout)
 
-        except httpx.TimeoutException:
-            error = f"HTTP timeout after {timeout}s"
-        except httpx.ConnectError:
-            # 触发熔断：标记 provider 不可达
-            provider_name = plugin.get("provider", "")
-            if provider_name and provider_name not in _disabled_providers:
-                _disabled_providers.add(provider_name)
-            error = f"provider {provider_name} unreachable"
-        except Exception as e:
-            error = str(e)
+        else:
+            # parallel：直接执行
+            result, error = await _execute_plugin(plugin, plugin_id, params, timeout)
 
         # 6. 注册逆操作（如果插件失败，不注册逆操作，Fiber fail 只需回滚自己）
         if error:
@@ -1637,6 +1728,10 @@ def create_app(cfg):
         # 提交校验节点
         fiber_commit(validation_fid)
 
+        # 写入全局去重表（全树可见）
+        result_preview = json.dumps(result, ensure_ascii=False)[:200]
+        _global_call_add(plugin_id, params_hash, fid, result_preview)
+
         # 成功：注册逆操作
         inverse_id = plugin.get("inverse")
         if inverse_id:
@@ -1651,15 +1746,12 @@ def create_app(cfg):
                     inv_params = {"_original_result": result, **p}
                     if inv_exec == "http":
                         inv_url = _format_string(inv_plugin.get("endpoint", ""), inv_params)
-                        import httpx
-                        import asyncio
                         try:
                             asyncio.run(httpx.AsyncClient(timeout=10).post(inv_url, json=inv_params))
                         except Exception:
                             pass
                     elif inv_exec == "cli":
                         inv_cmd = _format_string(inv_plugin.get("command", ""), inv_params)
-                        import subprocess
                         try:
                             subprocess.run(inv_cmd, shell=True, capture_output=True, timeout=10)
                         except Exception:
@@ -1708,6 +1800,10 @@ def main():
         t = threading.Thread(target=_circuit_breaker_loop, args=(_config,), daemon=True)
         t.start()
         print(f"   🔄 自动熔断已启用 (30s 滑动窗口, 错误率 >20% 自动禁用)")
+        # 启动全局去重定时清理线程
+        t2 = threading.Thread(target=_cleanup_global_history_periodic, daemon=True)
+        t2.start()
+        print(f"   📋 全局去重已启用 (24h TTL, 1h 定时清理)")
 
         # SIGHUP 热加载 — 自动 git commit 作为逆栈快照
         def _hup(signum, frame):
