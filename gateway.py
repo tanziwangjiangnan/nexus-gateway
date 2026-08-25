@@ -1065,14 +1065,38 @@ def create_app(cfg):
 
     # ── 智能体声明式接入 ──
     @app.get("/admin/agents/declaration")
-    async def admin_agents_declaration():
+    async def admin_agents_declaration(agent_id: str = None):
         """返回 gateway.yaml 中 agents 段的完整声明。
         智能体启动时调用此端点，根据自身 id 找到对应配置块，自动接入。
+        支持 ?agent_id=xxx 参数，返回该 Agent 可用的插件列表（按 capabilities 过滤）。
         """
-        agents = cfg.get("agents", {})
+        agents = cfg.get("agents", [])
         if not agents:
-            return {"agents": []}
-        return {"agents": agents}
+            return {"agents": [], "plugins": []}
+
+        result = {"agents": agents}
+
+        # 如果指定了 agent_id，返回该 Agent 可调用的插件列表
+        if agent_id:
+            agent_cfg = next((a for a in agents if a.get("id") == agent_id), None)
+            agent_caps = set(agent_cfg.get("capabilities", [])) if agent_cfg else set()
+            all_plugins = cfg.get("plugins", [])
+            if agent_caps:
+                available = []
+                for p in all_plugins:
+                    required = set(p.get("capabilities", []))
+                    if required - agent_caps:
+                        continue  # 缺少能力，跳过
+                    available.append(p)
+                result["plugins"] = available
+            else:
+                # 未知 Agent 或没有 capabilities → 只返回 read 插件
+                result["plugins"] = [p for p in all_plugins
+                                     if not (set(p.get("capabilities", [])) - {"read"})]
+        else:
+            result["plugins"] = cfg.get("plugins", [])
+
+        return result
 
     @app.get("/admin/agents/status")
     async def admin_agents_status():

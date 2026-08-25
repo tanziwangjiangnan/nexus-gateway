@@ -82,7 +82,7 @@ python3 gateway.py git-diff           # 未提交的配置变更
 | `POST /admin/fiber/check` | 创建检查任务 fiber（执行者-检查者模式） |
 | `GET /admin/undo` | 撤销上一条运行时操作 |
 | `GET /admin/undo-list` | 查看运行时逆栈 |
-| `GET /admin/agents/declaration` | 返回智能体声明配置（agents 段） |
+| `GET /admin/agents/declaration` | 返回智能体声明配置 + 可用插件列表（支持 `?agent_id=xxx` 过滤） |
 | `GET /admin/agents/status` | 返回所有声明 Agent 的存活状态 |
 | `GET /admin/logs` | 聚合所有 Agent 日志，按时间合并，支持 level/agent 过滤 |
 
@@ -128,6 +128,18 @@ agents:
 ```
 
 `GET /admin/agents/declaration` 返回完整声明，智能体启动时自动调用此端点完成接入。
+
+支持 `?agent_id=xxx` 参数，返回该 Agent **可调用的插件列表**（按 capabilities 过滤）：
+
+```bash
+# 获取 openhands 可用的插件（只返回 read 插件，因为 send_email 需要 destructive）
+curl -H "Authorization: Bearer $GW_KEY" 'http://127.0.0.1:8646/admin/agents/declaration?agent_id=openhands'
+
+# 获取所有插件
+curl -H "Authorization: Bearer $GW_KEY" http://127.0.0.1:8646/admin/agents/declaration
+```
+
+智能体启动时只需调用 `GET /admin/agents/declaration?agent_id=<自身id>`，即可同时获得配置和可用插件，无需额外发现步骤。
 
 `GET /admin/agents/status` 根据 type 探测存活状态：
 - `openhands`: 检查 workspace 下锁文件/PID
