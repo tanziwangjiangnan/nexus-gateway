@@ -15,6 +15,8 @@ OpenAI 兼容接口，按 model 名路由到三池，池内权重轮询，跨池
   python3 gateway.py undo               # 运行时逆栈：撤销最后一条操作
   python3 gateway.py undo-list          # 运行时逆栈：查看所有操作
   python3 gateway.py fiber              # 查看 fiber 树（通过 Admin API）
+  python3 gateway.py scan-agents         # 自动发现并接入智能体
+  python3 gateway.py scan-agents --dir /opt/agents  # 指定扫描目录
 
 API 端点:
   GET  /chat                    → 聊天页面（免鉴权，自备 Key）
@@ -1351,6 +1353,215 @@ def main():
                             _print_tree(int(fid))
         except Exception as e:
             print(f"❌ 调用失败: {e}")
+
+    elif args[0] == "scan-agents":
+        """自动发现并接入智能体。
+        扫描指定目录（默认 ~/agents/），寻找 Agent 特征文件，
+        交互式确认后自动写入 gateway.yaml 并热加载。
+        """
+        scan_dir = "~/agents"
+        if "--dir" in args:
+            idx = args.index("--dir")
+            if idx + 1 < len(args):
+                scan_dir = args[idx + 1]
+        scan_dir = os.path.expanduser(scan_dir)
+
+        if not os.path.isdir(scan_dir):
+            print(f"⚠️  目录不存在: {scan_dir}")
+            print(f"   创建后重试，或指定: python3 gateway.py scan-agents --dir /path/to/agents")
+            return
+
+        found = []
+        print(f"🔍 扫描 {scan_dir} ...")
+        for root, dirs, files in os.walk(scan_dir):
+            rel = os.path.relpath(root, scan_dir)
+            if rel.startswith(".") or rel.startswith("_"):
+                continue
+            # 跳过无关目录
+            basename = os.path.basename(root)
+            if basename in ("node_modules", "__pycache__", ".git", ".venv", "venv", "env", ".tox"):
+                dirs[:] = []  # 不深入
+                continue
+
+            # 特征: OpenHands — config.toml 含 [core] 或 .lock 文件
+            if "config.toml" in files:
+                try:
+                    content = open(os.path.join(root, "config.toml")).read()
+                    if "[core]" in content:
+                        found.append({
+                            "id": f"openhands-{len(found)}",
+                            "display_name": f"OpenHands ({rel})",
+                            "type": "openhands",
+                            "workspace": root,
+                            "capabilities": ["read", "write", "execute"],
+                            "confidence": "high",
+                            "evidence": f"config.toml → [core]",
+                        })
+                        continue
+                except:
+                    pass
+            lock_files = [f for f in files if f.endswith(".lock")]
+            if lock_files:
+                found.append({
+                    "id": f"openhands-{len(found)}",
+                    "display_name": f"OpenHands ({rel})",
+                    "type": "openhands",
+                    "workspace": root,
+                    "capabilities": ["read", "write", "execute"],
+                    "confidence": "medium",
+                    "evidence": f"lock 文件: {', '.join(lock_files[:3])}",
+                })
+                continue
+
+            # 特征: AstrBot — main.py 含 AstrBot 或 config.yaml 含 adapters
+            if "main.py" in files:
+                try:
+                    content = open(os.path.join(root, "main.py")).read()
+                    if "AstrBot" in content or "astrbot" in content.lower():
+                        found.append({
+                            "id": f"astrbot-{len(found)}",
+                            "display_name": f"AstrBot ({rel})",
+                            "type": "astrbot",
+                            "base_url": "http://127.0.0.1:12345",
+                            "capabilities": ["read"],
+                            "confidence": "high",
+                            "evidence": "main.py → AstrBot",
+                        })
+                        continue
+                except:
+                    pass
+            if "config.yaml" in files:
+                try:
+                    content = open(os.path.join(root, "config.yaml")).read()
+                    if "adapters" in content:
+                        found.append({
+                            "id": f"astrbot-{len(found)}",
+                            "display_name": f"AstrBot ({rel})",
+                            "type": "astrbot",
+                            "base_url": "http://127.0.0.1:12345",
+                            "capabilities": ["read"],
+                            "confidence": "medium",
+                            "evidence": "config.yaml → adapters",
+                        })
+                        continue
+                except:
+                    pass
+
+            # 特征: 通用脚本 — 有 .pid 文件或 main.py 含 daemon
+            pid_files = [f for f in files if f.endswith(".pid")]
+            if pid_files:
+                found.append({
+                    "id": f"agent-{len(found)}",
+                    "display_name": f"Agent ({rel})",
+                    "type": "generic",
+                    "command": f"python3 {os.path.join(root, 'main.py')}" if "main.py" in files else "",
+                    "pid_file": os.path.join(root, pid_files[0]),
+                    "capabilities": ["read"],
+                    "confidence": "medium",
+                    "evidence": f"pid 文件: {pid_files[0]}",
+                })
+                continue
+
+        if not found:
+            print(f"  未发现已知的智能体。")
+            print(f"  提示: 将智能体放在 {scan_dir} 下的子目录中，或手动编辑 gateway.yaml 的 agents 段。")
+            return
+
+        print(f"\n📋 发现 {len(found)} 个智能体候选:\n")
+        for i, agent in enumerate(found, 1):
+            icon = {"openhands": "🤖", "astrbot": "💬", "generic": "⚙️"}.get(agent["type"], "❓")
+            print(f"  {i}. {icon} {agent['display_name']}")
+            print(f"     类型: {agent['type']} | 置信度: {agent['confidence']}")
+            print(f"     证据: {agent['evidence']}")
+            if agent.get("workspace"):
+                print(f"     路径: {agent['workspace']}")
+            if agent.get("pid_file"):
+                print(f"     PID: {agent['pid_file']}")
+            print()
+
+        # 交互式确认
+        print(f"是否接入以上 {len(found)} 个智能体到 gateway.yaml？")
+        # 读取已存在的 agents 列表，避免重复
+        existing = _config.get("agents", [])
+        existing_ids = {a["id"] for a in existing}
+
+        to_add = []
+        for agent in found:
+            if agent["id"] in existing_ids:
+                print(f"  ⏭️  {agent['display_name']} 已存在，跳过")
+                continue
+            # 构造 YAML 配置块
+            entry = {
+                "id": agent["id"],
+                "display_name": agent["display_name"],
+                "type": agent["type"],
+                "capabilities": agent["capabilities"],
+            }
+            if agent.get("workspace"):
+                entry["workspace"] = agent["workspace"]
+            if agent.get("base_url"):
+                entry["base_url"] = agent["base_url"]
+            if agent.get("command"):
+                entry["command"] = agent["command"]
+            if agent.get("pid_file"):
+                entry["pid_file"] = agent["pid_file"]
+            to_add.append(entry)
+
+        if not to_add:
+            print("  没有新增的智能体需要接入。")
+            return
+
+        print(f"  将接入 {len(to_add)} 个新智能体。确认？[Y/n] ", end="")
+        try:
+            resp = input().strip().lower()
+        except:
+            resp = "y"
+        if resp not in ("", "y", "yes"):
+            print("  已取消")
+            return
+
+        # 写入 YAML
+        yaml_path = CONFIG_PATH
+        with open(yaml_path) as f:
+            raw = f.read()
+
+        # 找到 agents 段或 validation 段前插入
+        agents_yaml = yaml.dump(to_add, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        # 缩进处理
+        agents_yaml = "\n".join("  " + line if line.strip() else "" for line in agents_yaml.strip().split("\n"))
+
+        if "# ── 智能体声明" in raw:
+            # 追加到现有 agents 段
+            insert_pos = raw.rfind("\n  - id:")
+            raw = raw[:insert_pos] + "\n" + agents_yaml + raw[insert_pos:]
+        else:
+            # 在 validation 前插入新 agents 段
+            marker = "# ── 验证模式"
+            agents_block = f"\n# ── 智能体声明 ──\n# 自动发现: scan-agents 命令生成\n# 不迁移、不复制任何用户文件，只需声明路径/地址。\nagents:\n{agents_yaml}\n\n"
+            if marker in raw:
+                raw = raw.replace(marker, agents_block + marker)
+            else:
+                raw += "\n" + agents_block
+
+        with open(yaml_path, "w") as f:
+            f.write(raw)
+
+        # 热加载
+        print(f"  ✅ 已写入 {yaml_path}")
+        try:
+            subprocess.run(["systemctl", "reload", "gateway"], capture_output=True, timeout=10)
+            # 也直接 SIGHUP 以防 systemctl 没生效
+            pid_file = os.path.join(BASE, "gateway.pid")
+            if os.path.exists(pid_file):
+                with open(pid_file) as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, signal.SIGHUP)
+            print(f"  🔄 gateway 已热加载")
+        except Exception as e:
+            print(f"  ⚠️  热加载失败: {e}，手动执行: systemctl reload gateway")
+        print(f"\n✨ 已完成。新增 {len(to_add)} 个智能体:")
+        for a in to_add:
+            print(f"   • {a['display_name']} ({a['type']})")
 
     else:
         print(f"未知命令: {args[0]}")
