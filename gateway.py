@@ -1866,6 +1866,27 @@ def main():
             print(f"  提示: 将智能体放在 {scan_dir} 下的子目录中，或手动编辑 gateway.yaml 的 agents 段。")
             return
 
+        # 扫描插件清单：每个 Agent 目录下的 plugins.yaml
+        discovered_plugins = []
+        for agent in found:
+            agent_dir = agent.get("workspace") or os.path.dirname(agent.get("pid_file", ""))
+            if not agent_dir:
+                continue
+            plugin_file = os.path.join(agent_dir, "plugins.yaml")
+            if os.path.isfile(plugin_file):
+                try:
+                    with open(plugin_file) as f:
+                        raw = f.read()
+                    plugin_list = yaml.safe_load(raw) or []
+                    if isinstance(plugin_list, list):
+                        for p in plugin_list:
+                            p["provider"] = agent["id"]
+                            if "id" not in p:
+                                p["id"] = f"{agent['id']}-{p.get('display_name', 'plugin')}"
+                            discovered_plugins.append(p)
+                except Exception as e:
+                    print(f"  ⚠️  解析 {agent['id']} 的 plugins.yaml 失败: {e}")
+
         print(f"\n📋 发现 {len(found)} 个智能体候选:\n")
         for i, agent in enumerate(found, 1):
             icon = {"openhands": "🤖", "astrbot": "💬", "generic": "⚙️"}.get(agent["type"], "❓")
@@ -1876,6 +1897,11 @@ def main():
                 print(f"     路径: {agent['workspace']}")
             if agent.get("pid_file"):
                 print(f"     PID: {agent['pid_file']}")
+            # 显示该 Agent 提供的插件
+            agent_plugins = [p for p in discovered_plugins if p.get("provider") == agent["id"]]
+            if agent_plugins:
+                for p in agent_plugins:
+                    print(f"     📦 插件: {p.get('display_name', p['id'])} ({p.get('execution', '?')})")
             print()
 
         # 交互式确认
@@ -1941,6 +1967,36 @@ def main():
                 raw = raw.replace(marker, agents_block + marker)
             else:
                 raw += "\n" + agents_block
+
+        # 写入发现的插件清单
+        if discovered_plugins:
+            # 去重：已有 plugins 段则合并，避免重复
+            existing_plugins = {p["id"] for p in _config.get("plugins", [])}
+            new_plugins = [p for p in discovered_plugins if p["id"] not in existing_plugins]
+            if new_plugins:
+                plugins_yaml = yaml.dump(new_plugins, default_flow_style=False, allow_unicode=True, sort_keys=False)
+                plugins_yaml = "\n".join("  " + line if line.strip() else "" for line in plugins_yaml.strip().split("\n"))
+
+                if "# ── 插件声明" in raw:
+                    # 追加到现有 plugins 段
+                    insert_pos = raw.rfind("\n  - id:")
+                    # 找到 plugins 段的最后一个 id，而不是 agents 段的
+                    # 更可靠：在 ## 插件声明 之后找最后一个 - id:
+                    plugins_section = raw[raw.find("# ── 插件声明"):]
+                    last_id_in_plugins = plugins_section.rfind("\n  - id:")
+                    if last_id_in_plugins >= 0:
+                        abs_pos = raw.find("# ── 插件声明") + last_id_in_plugins
+                        raw = raw[:abs_pos] + "\n" + plugins_yaml + raw[abs_pos:]
+                    else:
+                        raw = raw.replace("# ── 插件声明", f"# ── 插件声明 ──\nplugins:\n{plugins_yaml}\n")
+                else:
+                    agents_block = f"\n# ── 插件声明 ──\n# 自动发现: scan-agents 命令生成\nplugins:\n{plugins_yaml}\n\n"
+                    # 在 validation 前插入
+                    marker = "# ── 验证模式"
+                    if marker in raw:
+                        raw = raw.replace(marker, agents_block + marker)
+                    else:
+                        raw += "\n" + agents_block
 
         with open(yaml_path, "w") as f:
             f.write(raw)
