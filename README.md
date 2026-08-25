@@ -41,6 +41,8 @@ python3 gateway.py sync-runtime       # 热加载配置（SIGHUP）
 python3 gateway.py undo               # 撤销上一条运行时操作
 python3 gateway.py undo-list          # 查看运行时逆栈
 python3 gateway.py fiber              # 查看 Agent 任务树
+python3 gateway.py scan-agents        # 自动发现并接入智能体
+python3 gateway.py scan-agents --dir /opt/agents  # 指定扫描目录
 python3 gateway.py git-log            # 配置变更历史
 python3 gateway.py git-diff           # 未提交的配置变更
 ```
@@ -161,6 +163,25 @@ validation:
 ### 逆栈覆盖
 
 检查不通过时，自动触发执行者的逆栈回滚。例如检查者发现"执行者发了邮件但收件人错了"，只需 fail 检查任务，触发执行者的逆栈，自动撤回邮件。检查者本身不负责修复，只负责验收。
+
+## 自动发现智能体
+
+无需手动编辑 YAML，只需把智能体放在约定目录，跑一次命令即可接入：
+
+```bash
+# 默认扫描 ~/agents/
+python3 gateway.py scan-agents
+
+# 指定目录
+python3 gateway.py scan-agents --dir /opt/agents
+```
+
+网关自动识别：
+- **OpenHands** — 识别 `config.toml` 含 `[core]` 或 `.lock` 文件
+- **AstrBot** — 识别 `main.py` 含 `AstrBot` 或 `config.yaml` 含 `adapters`
+- **通用脚本** — 识别 `.pid` 文件
+
+交互式确认后自动写入 `gateway.yaml` 并热加载，无需手动编辑。
 
 ## 部署
 
