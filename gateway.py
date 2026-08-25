@@ -15,7 +15,7 @@ OpenAI 兼容接口，按 model 名路由到三池，池内权重轮询，跨池
   python3 gateway.py undo               # 运行时逆栈：撤销最后一条操作
   python3 gateway.py undo-list          # 运行时逆栈：查看所有操作
   python3 gateway.py fiber              # 查看 fiber 树（通过 Admin API）
-  python3 gateway.py scan-agents         # 自动发现并接入智能体
+  python3 gateway.py scan-agents         # 自动发现并接入智能体（含插件声明）
   python3 gateway.py scan-agents --dir /opt/agents  # 指定扫描目录
 
 API 端点:

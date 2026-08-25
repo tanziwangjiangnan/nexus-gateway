@@ -200,7 +200,26 @@ python3 gateway.py scan-agents --dir /opt/agents
 - **AstrBot** — 识别 `main.py` 含 `AstrBot` 或 `config.yaml` 含 `adapters`
 - **通用脚本** — 识别 `.pid` 文件
 
-交互式确认后自动写入 `gateway.yaml` 并热加载，无需手动编辑。
+### 插件自动声明
+
+每个 Agent 目录下放一个 `plugins.yaml`，声明该 Agent 提供的插件：
+
+```yaml
+# /opt/agents/hermes-smtp/plugins.yaml
+- id: send_email
+  display_name: "发送邮件"
+  description: "通过 SMTP 发送邮件"
+  execution: cli
+  command: python3 /opt/hermes/smtp.py --to "{to}" --subject "{subject}" --body "{body}"
+  input_schema: { to: string, subject: string, body: string }
+  output_schema: { msg_id: string, status: string }
+  inverse: recall_email
+  capabilities: [write, destructive]
+  timeout: 30
+  concurrent: false
+```
+
+`scan-agents` 扫描时自动发现 `plugins.yaml`，自动填充 `provider` 字段为 Agent 的 `id`，去重写入 `gateway.yaml` 的 `plugins` 段并热加载。**无需手动编辑任何文件。**
 
 ## 日志聚合
 
