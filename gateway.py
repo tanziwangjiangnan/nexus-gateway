@@ -22,7 +22,7 @@ API 端点:
   GET  /chat                    → 聊天页面（免鉴权，自备 Key）
   GET  /v1/models                → 模型目录（含池/provider/健康/用量）
   POST /v1/chat/completions      → OpenAI 兼容，三池路由 + 自定义 Key
-  POST /v1/plugins/{id}/call     → 统一插件调用：capabilities 校验 + 审批缓存 + Fiber 逆操作
+  POST /v1/plugins/{id}/call     → 统一插件调用：capabilities 校验 + 重复调用拦截 + Fiber 逆操作 + 动态校验
   GET  /health                   → 网关自身健康检查
   GET  /metrics                  → Prometheus 指标
   GET  /admin/pools              → 查看各池/provider 状态
@@ -42,6 +42,7 @@ API 端点:
   GET  /admin/logs               → 聚合所有声明 Agent 的日志，按时间合并，支持 ?level=&agent=&lines= 过滤
 """
 import datetime
+import hashlib
 import json
 import os
 import random
@@ -233,6 +234,7 @@ class Fiber:
     - 子 fiber 失败时级联回滚祖先
     - undo_log 是 fiber 本地逆栈，提交时合并到父 fiber 或全局栈
     - capabilities 声明此 fiber 的权限（执行者: write/execute, 检查者: read/validate/inspect）
+    - call_history 记录本 fiber 及其父 fiber 已调用的 (plugin_id, params_hash)，用于重复调用拦截
     """
     id: int
     parent_id: int | None
@@ -242,6 +244,7 @@ class Fiber:
     undo_log: list = dataclasses.field(default_factory=list)  # [(desc, callable), ...]
     children: list = dataclasses.field(default_factory=list)  # [fiber_id, ...]
     capabilities: list = dataclasses.field(default_factory=list)  # ["read", "write", "validate", "inspect", "execute"]
+    call_history: list = dataclasses.field(default_factory=list)  # [{"plugin_id": str, "params_hash": str, "time": float}, ...]
     created_at: float = dataclasses.field(default_factory=time.time)
 
 def fiber_create(agent_id, description, parent_id=None, capabilities=None):
@@ -1059,6 +1062,7 @@ def create_app(cfg):
                 "undo_count": len(f.undo_log),
                 "children": sorted(f.children),
                 "capabilities": f.capabilities,
+                "call_history": f.call_history,
                 "created_at": datetime.datetime.fromtimestamp(f.created_at).isoformat(),
             }
         return {"fibers": {fid: _serialize(f) for fid, f in sorted(_fibers.items())}}
@@ -1389,7 +1393,6 @@ def create_app(cfg):
             raise HTTPException(status_code=404, detail=f"provider '{provider_name}' not found in pool '{pool_name}'")
 
         # 计算操作 hash（同一 agent 同一 provider 同一操作免审）
-        import hashlib
         action_hash = hashlib.md5(f"{agent_id}:{provider_name}:toggle".encode()).hexdigest()
         now = time.time()
         cached = action_hash in _approval_cache and _approval_cache[action_hash] > now
@@ -1476,7 +1479,6 @@ def create_app(cfg):
         action_body = {}
         for k, v in params.items():
             action_body[k] = v
-        import hashlib
         action_hash = hashlib.md5(f"{agent_id}:{plugin_id}:{json.dumps(action_body, sort_keys=True)}".encode()).hexdigest()
         now = time.time()
         cached = action_hash in _approval_cache and _approval_cache[action_hash] > now
@@ -1492,6 +1494,34 @@ def create_app(cfg):
             parent_id=fiber_id,
             capabilities=list(agent_caps) if agent_caps else None,
         )
+
+        # ── 任务2: 重复调用拦截（循环检测） ──
+        if fiber_id is not None:
+            # 遍历当前 fiber 及其所有父 fiber 的 call_history
+            cursor = _fibers.get(fiber_id)
+            while cursor is not None:
+                for entry in cursor.call_history:
+                    if entry["plugin_id"] == plugin_id and entry["params_hash"] == action_hash:
+                        return {
+                            "plugin_id": plugin_id,
+                            "status": "duplicate",
+                            "error": "duplicate_call_detected",
+                            "params_hash": action_hash,
+                            "fiber_id": fid,
+                            "previous_call_time": entry.get("time"),
+                        }
+                if cursor.parent_id is not None and cursor.parent_id in _fibers:
+                    cursor = _fibers[cursor.parent_id]
+                else:
+                    break
+
+        # 记录本次调用到 fiber 的 call_history
+        # 同时记录到父 fiber 上，使父 fiber 能被子树的重复检测发现
+        call_entry = {"plugin_id": plugin_id, "params_hash": action_hash, "time": time.time()}
+        if fid in _fibers:
+            _fibers[fid].call_history.append(call_entry)
+        if fiber_id is not None and fiber_id in _fibers:
+            _fibers[fiber_id].call_history.append(call_entry)
 
         # 5. 执行插件
         exec_mode = plugin.get("execution", "http")
@@ -1539,7 +1569,11 @@ def create_app(cfg):
         except httpx.TimeoutException:
             error = f"HTTP timeout after {timeout}s"
         except httpx.ConnectError:
-            error = f"provider {plugin.get('provider', 'unknown')} unreachable"
+            # 触发熔断：标记 provider 不可达
+            provider_name = plugin.get("provider", "")
+            if provider_name and provider_name not in _disabled_providers:
+                _disabled_providers.add(provider_name)
+            error = f"provider {provider_name} unreachable"
         except Exception as e:
             error = str(e)
 
@@ -1554,6 +1588,54 @@ def create_app(cfg):
                 "fiber_id": fid,
                 "cached": cached,
             }
+
+        # ── 任务3: 工具调用级动态校验 ──
+        validation_fid = fiber_create(
+            agent_id=plugin.get("provider", "gateway"),
+            description=f"[校验] {plugin.get('display_name', plugin_id)} 结果",
+            parent_id=fid,
+            capabilities=["validate"],
+        )
+
+        validation_errors = []
+        # 3a. Schema 校验（匹配 output_schema）
+        output_schema = plugin.get("output_schema", {})
+        if output_schema:
+            for field, expected_type in output_schema.items():
+                actual = result.get(field)
+                if actual is None:
+                    validation_errors.append(f"缺少字段 {field}")
+                    continue
+                if expected_type in ("string", "integer", "array", "object", "boolean", "number"):
+                    type_map = {
+                        "string": str, "integer": int, "number": (int, float),
+                        "array": list, "object": dict, "boolean": bool,
+                    }
+                    expected_py = type_map.get(expected_type, str)
+                    if not isinstance(actual, expected_py):
+                        validation_errors.append(f"字段 {field} 期望 {expected_type}，实际 {type(actual).__name__}")
+
+        if validation_errors:
+            fiber_fail(validation_fid, cascade_parent=True)  # 级联回滚 tool_exec
+            return {
+                "plugin_id": plugin_id,
+                "status": "validation_failed",
+                "result": result,
+                "validation_errors": validation_errors,
+                "fiber_id": fid,
+                "validation_fiber_id": validation_fid,
+                "cached": cached,
+            }
+
+        # 3b. 检查者语义验证（若配置了 checker_agent，通过 HTTP 调用验证）
+        # 当前仅做 schema 校验；检查者 HTTP 端点待后续接入
+        checker_agent = cfg.get("validation", {}).get("checker_agent", "")
+        if checker_agent:
+            # 预留：检查者 Agent 的 HTTP 验证接口 — 当前仅做 schema 校验
+            pass
+
+        # 提交校验节点
+        fiber_commit(validation_fid)
 
         # 成功：注册逆操作
         inverse_id = plugin.get("inverse")
@@ -1594,6 +1676,7 @@ def create_app(cfg):
             "status": "ok",
             "result": result,
             "fiber_id": fid,
+            "validation_fiber_id": validation_fid,
             "cached": cached,
         }
 

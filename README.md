@@ -67,7 +67,7 @@ python3 gateway.py git-diff           # 未提交的配置变更
 | `GET /health` | 健康检查（免鉴权） |
 | `GET /chat` | 聊天页面（免鉴权） |
 | `POST /v1/chat/completions` | OpenAI 兼容推理（支持 `api_key` 字段透传自定义 Key） |
-| `POST /v1/plugins/{id}/call` | 统一插件调用：capabilities 校验 + 审批缓存 + Fiber 逆操作 |
+| `POST /v1/plugins/{id}/call` | 统一插件调用：capabilities 校验 + 审批缓存 + Fiber 逆操作 + 重复调用拦截 + 动态 Schema 校验 |
 | `GET /v1/models` | 模型目录 |
 | `GET /metrics` | Prometheus 指标 |
 | `GET /admin/pools` | 池/provider 状态 |
@@ -352,3 +352,4 @@ SIGHUP 热加载：自动 git commit 快照 + 清空运行时状态 + 重启生�
 | v2.5 | Agent 插件发现：`/admin/agents/declaration?agent_id=xxx` 返回可调用插件列表 | 2026-08-25 |
 | v2.5 | `scan-agents` 自动发现 `plugins.yaml`：Agent 目录下插件清单自动声明 | 2026-08-25 |
 | v2.6 | 执行者-检查者模式：`/admin/fiber/check`，级联回滚，capabilities 权限校验，检查者证据 | 2026-08-25 |
+| v2.7 | 三池层级关系确认 + 重复调用拦截 + 工具调用级动态校验（Schema 校验 + 熔断联动） | 2026-08-25 |
