@@ -78,6 +78,7 @@ python3 gateway.py git-diff           # 未提交的配置变更
 | `GET /admin/agents/declaration` | 返回智能体声明配置（agents 段） |
 | `GET /admin/agents/status` | 返回所有声明 Agent 的存活状态 |
 | `POST /admin/fiber/check` | 创建检查任务 fiber（执行者-检查者模式） |
+| `GET /admin/logs` | 聚合所有 Agent 日志，按时间合并，支持 level/agent 过滤 |
 
 ## 配置
 
@@ -183,6 +184,47 @@ python3 gateway.py scan-agents --dir /opt/agents
 
 交互式确认后自动写入 `gateway.yaml` 并热加载，无需手动编辑。
 
+## 日志聚合
+
+`GET /admin/logs` 统一读取所有声明 Agent 的日志，按时间戳合并排序，无需切换终端翻日志。
+
+```bash
+# 查看所有 Agent 日志
+curl http://127.0.0.1:8646/admin/logs
+
+# 只看 ERROR
+curl 'http://127.0.0.1:8646/admin/logs?level=ERROR'
+
+# 只看特定 Agent
+curl 'http://127.0.0.1:8646/admin/logs?agent=openhands'
+
+# 只看某个时间点之后的日志
+curl 'http://127.0.0.1:8646/admin/logs?since=2026-08-25T12:00:00&level=ERROR,WARN'
+
+# 每个 Agent 只看最后 50 行
+curl 'http://127.0.0.1:8646/admin/logs?lines=50'
+```
+
+### 读取方式
+
+| Agent 类型 | 读取方式 |
+|-----------|---------|
+| `openhands` | 扫描 workspace/logs/ 下所有 `.log`/`.txt`/`.out`/`.err` 文件 |
+| `astrbot` | `GET base_url/logs` 远程拉取（需 Agent 暴露端点） |
+| `generic` | 扫描 workspace/logs/ 或 pid_file 所在目录的 logs/ |
+
+### 与检查者协同
+
+检查者验收失败时，可以通过 `POST /admin/fiber/{id}/fail` 的 `evidence` 字段附上日志片段：
+
+```json
+{
+  "evidence": "检查者日志：\n12:00:10 [ERROR] KeyError: model \"gpt-5\" not found\n12:00:11 [INFO] 回滚操作已执行"
+}
+```
+
+网关自动收集检查者自身的日志并附在失败报告中，让问题定位一目了然。
+
 ## 部署
 
 ```bash
@@ -219,4 +261,5 @@ SIGHUP 热加载：自动 git commit 快照 + 清空运行时状态 + 重启生�
 | v2.5 | 聊天页面 `/chat`，自定义 Key 透传 | 2026-08 |
 | v2.5 | 智能体声明式接入，`/admin/agents/declaration` + `/admin/agents/status` | 2026-08-25 |
 | v2.5 | `scan-agents` 自动发现：扫描目录→交互确认→写入 YAML→热加载 | 2026-08-25 |
-| v2.6 | 执行者-检查者模式：`/admin/fiber/check`，级联回滚，capabilities 权限校验 | 2026-08-25 |
+| v2.5 | 日志聚合 `/admin/logs`：统一读取所有 Agent 日志，按时间合并，level/agent 过滤 | 2026-08-25 |
+| v2.6 | 执行者-检查者模式：`/admin/fiber/check`，级联回滚，capabilities 权限校验，检查者证据 | 2026-08-25 |

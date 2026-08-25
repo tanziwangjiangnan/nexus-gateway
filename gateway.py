@@ -38,11 +38,13 @@ API 端点:
   GET  /admin/agents/declaration → 返回智能体声明配置（agents 段）
   GET  /admin/agents/status      → 返回所有声明 Agent 的存活状态
   POST /admin/fiber/check        → 创建检查任务 fiber（执行者-检查者模式）
+  GET  /admin/logs               → 聚合所有声明 Agent 的日志，按时间合并，支持 ?level=&agent=&lines= 过滤
 """
 import datetime
 import json
 import os
 import random
+import re
 import signal
 import sqlite3
 import subprocess
@@ -320,6 +322,40 @@ def fiber_commit(fiber_id):
         _undo_stack.extend(f.undo_log)
     f.undo_log.clear()
     f.status = "committed"
+    return True
+
+# ── 日志解析辅助 ──
+_LOG_PATTERN = re.compile(
+    r'(?P<ts>\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)'
+    r'\s*'
+    r'(?:\[?\s*(?P<level>DEBUG|INFO|WARN(?:ING)?|ERROR|CRITICAL|FATAL|TRACE)\s*\]?)?',
+    re.IGNORECASE,
+)
+
+def _parse_log_line(line: str, agent_id: str, source: str) -> dict | None:
+    """解析单行日志，返回结构化字典或 None。"""
+    line = line.rstrip("\n\r")
+    if not line:
+        return None
+    m = _LOG_PATTERN.search(line)
+    ts = m.group("ts") if m else ""
+    level = m.group("level").upper() if m and m.group("level") else "INFO"
+    # 规范化级别名
+    level = level.replace("WARNING", "WARN").replace("CRITICAL", "FATAL")
+    return {
+        "timestamp": ts,
+        "level": level,
+        "agent_id": agent_id,
+        "source": source,
+        "message": line,
+    }
+
+def _log_matches(entry: dict, filter_levels: list[str], since_str: str) -> bool:
+    """检查日志条目是否匹配过滤条件。"""
+    if filter_levels and entry.get("level", "") not in filter_levels:
+        return False
+    if since_str and entry.get("timestamp", "") < since_str:
+        return False
     return True
 
 # ── 路由引擎 ──
@@ -951,11 +987,45 @@ def create_app(cfg):
         return {"fiber_id": fid, "parent_id": f.parent_id, "status": f.status, "description": f.description, "capabilities": capabilities}
 
     @app.post("/admin/fiber/{fiber_id}/fail")
-    async def admin_fiber_fail(fiber_id: int):
+    async def admin_fiber_fail(fiber_id: int, request: Request):
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
         ok, ops = fiber_fail(fiber_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"fiber {fiber_id} not found or not active")
-        return {"fiber_id": fiber_id, "status": "failed", "rollback_ops": ops}
+        result = {"fiber_id": fiber_id, "status": "failed", "rollback_ops": ops}
+        # 检查者证据：检查者可以通过 evidence 字段附上日志片段
+        evidence = body.get("evidence", "")
+        if evidence:
+            result["evidence"] = evidence
+        # 自动收集检查者日志（如果此 fiber 是检查者节点）
+        f = _fibers.get(fiber_id)
+        if f and f.agent_id and "checker" in f.agent_id.lower():
+            try:
+                evidence_logs = []
+                agents_cfg = cfg.get("agents", [])
+                checker_cfg = next((a for a in agents_cfg if a.get("id") == f.agent_id), None)
+                if checker_cfg:
+                    # 读检查者自身日志的最后 20 行
+                    pid_file = checker_cfg.get("pid_file", "")
+                    if pid_file and os.path.exists(pid_file):
+                        with open(pid_file) as pf:
+                            pid = pf.read().strip()
+                        # 尝试读 journalctl 或日志文件
+                        log_dir = os.path.join(os.path.dirname(pid_file), "logs")
+                        if os.path.isdir(log_dir):
+                            for lf in sorted(os.listdir(log_dir))[-3:]:
+                                lfp = os.path.join(log_dir, lf)
+                                try:
+                                    with open(lfp, errors="replace") as lf_obj:
+                                        log_lines = lf_obj.readlines()[-20:]
+                                    evidence_logs.extend(log_lines)
+                                except Exception:
+                                    pass
+                if evidence_logs:
+                    result["checker_logs"] = evidence_logs
+            except Exception:
+                pass
+        return result
 
     @app.post("/admin/fiber/{fiber_id}/commit")
     async def admin_fiber_commit(fiber_id: int):
@@ -1070,6 +1140,132 @@ def create_app(cfg):
             })
 
         return {"agents": results}
+
+    # ── 日志聚合 /admin/logs ──
+    @app.get("/admin/logs")
+    async def admin_logs(request: Request):
+        """聚合所有声明 Agent 的日志，按时间戳合并排序。
+        查询参数:
+        - agent: 按 agent id 过滤（逗号分隔）
+        - level: 按日志级别过滤（DEBUG, INFO, WARN, ERROR，逗号分隔）
+        - lines: 每个 Agent 最多读取行数（默认 100）
+        - since: 只返回此时间戳之后的日志（ISO 格式）
+        """
+        params = dict(request.query_params)
+        filter_agents = params.get("agent", "").split(",") if params.get("agent") else []
+        filter_levels = params.get("level", "").upper().split(",") if params.get("level") else []
+        max_lines = int(params.get("lines", 100))
+        since_str = params.get("since", "")
+
+        agents = cfg.get("agents", [])
+        if filter_agents:
+            agents = [a for a in agents if a.get("id") in filter_agents]
+        if not agents:
+            return {"logs": [], "total": 0, "agents_checked": 0}
+
+        all_entries = []
+        errors = []
+
+        for agent in agents:
+            aid = agent.get("id", "unknown")
+            atype = agent.get("type", "generic")
+            try:
+                if atype == "openhands":
+                    ws = agent.get("workspace", "")
+                    log_dirs = [
+                        os.path.join(ws, "logs"),
+                        os.path.join(ws, "log"),
+                        ws,
+                    ]
+                    seen = set()
+                    for ld in log_dirs:
+                        if not os.path.isdir(ld):
+                            continue
+                        for fname in sorted(os.listdir(ld)):
+                            if not fname.endswith((".log", ".txt", ".out", ".err")):
+                                continue
+                            fpath = os.path.join(ld, fname)
+                            if fpath in seen:
+                                continue
+                            seen.add(fpath)
+                            try:
+                                with open(fpath, errors="replace") as f:
+                                    lines = f.readlines()
+                            except Exception:
+                                continue
+                            for line in lines[-max_lines:]:
+                                parsed = _parse_log_line(line, aid, fname)
+                                if parsed and _log_matches(parsed, filter_levels, since_str):
+                                    all_entries.append(parsed)
+
+                elif atype == "astrbot":
+                    base_url = agent.get("base_url", "")
+                    if base_url:
+                        import httpx
+                        try:
+                            async with httpx.AsyncClient(timeout=5) as client:
+                                resp = await client.get(f"{base_url}/logs")
+                                if resp.status_code == 200:
+                                    raw = resp.text
+                                    for line in raw.split("\n")[-max_lines:]:
+                                        parsed = _parse_log_line(line, aid, "remote")
+                                        if parsed and _log_matches(parsed, filter_levels, since_str):
+                                            all_entries.append(parsed)
+                        except Exception as e:
+                            errors.append({"agent_id": aid, "error": f"remote fetch: {str(e)[:80]}"})
+
+                elif atype == "generic":
+                    # 尝试读日志目录（约定 workspace/logs/ 或 command 所在目录的 logs/）
+                    ws = agent.get("workspace", "")
+                    candidate_dirs = []
+                    if ws:
+                        candidate_dirs = [
+                            os.path.join(ws, "logs"),
+                            os.path.join(ws, "log"),
+                        ]
+                    pid_file = agent.get("pid_file", "")
+                    if pid_file:
+                        pid_dir = os.path.dirname(pid_file)
+                        candidate_dirs.append(os.path.join(pid_dir, "logs"))
+                    seen = set()
+                    for ld in candidate_dirs:
+                        if not os.path.isdir(ld):
+                            continue
+                        for fname in sorted(os.listdir(ld)):
+                            if not fname.endswith((".log", ".txt", ".out", ".err")):
+                                continue
+                            fpath = os.path.join(ld, fname)
+                            if fpath in seen:
+                                continue
+                            seen.add(fpath)
+                            try:
+                                with open(fpath, errors="replace") as f:
+                                    lines = f.readlines()
+                            except Exception:
+                                continue
+                            for line in lines[-max_lines:]:
+                                parsed = _parse_log_line(line, aid, fname)
+                                if parsed and _log_matches(parsed, filter_levels, since_str):
+                                    all_entries.append(parsed)
+
+            except Exception as e:
+                errors.append({"agent_id": aid, "error": str(e)[:80]})
+
+        # 按时间戳合并排序
+        all_entries.sort(key=lambda x: x.get("timestamp", ""))
+
+        # 截断总行数
+        total = len(all_entries)
+        if total > 5000:
+            all_entries = all_entries[:5000]
+
+        return {
+            "logs": all_entries,
+            "total": total,
+            "returned": len(all_entries),
+            "agents_checked": len(agents),
+            "errors": errors if errors else None,
+        }
 
     # ── 执行者-检查者模式：创建检查任务 fiber ──
     @app.post("/admin/fiber/check")
