@@ -40,6 +40,8 @@
 - `python3 gateway.py fiber` — 查看 Agent 任务树
 - `python3 gateway.py quality` — 查看 Provider 质量排名（v2.10）
 - `python3 gateway.py feedback-stats` — 查看用户反馈统计（v2.10）
+- `python3 gateway.py check-deps` — 反向依赖扫描：检查 Key/URL 被哪些组件引用（v2.11）
+- `python3 gateway.py check-deps --auto-sync` — 扫描 + 自动同步到远程（v2.11）
 - `systemctl reload gateway` — 配置热加载
 - `journalctl -u gateway --no-pager -n 50` — 查看网关日志
 
