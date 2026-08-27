@@ -17,6 +17,11 @@ OpenAI 兼容接口，按 model 名路由到三池，池内权重轮询，跨池
   python3 gateway.py fiber              # 查看 fiber 树（通过 Admin API）
   python3 gateway.py scan-agents         # 自动发现并接入智能体（含插件声明）
   python3 gateway.py scan-agents --dir /opt/agents  # 指定扫描目录
+  python3 gateway.py check-deps           # 反向依赖扫描：检查 Key 被哪些组件引用
+  python3 gateway.py check-deps --auto-sync  # 扫描 + 自动同步（本地 sed + 远程 SSH）
+  python3 gateway.py check-deps "sk-xxx"  # 只检查特定 Key
+  python3 gateway.py quality             # 查看 Provider 质量排名（检查者评分）
+  python3 gateway.py feedback-stats      # 查看 Provider 用户反馈统计
 
 API 端点:
   GET  /chat                    → 聊天页面（免鉴权，自备 Key）
@@ -51,11 +56,17 @@ import re
 import signal
 import sqlite3
 import subprocess
+import shlex
 import sys
 import time
 import threading
 import yaml
 import httpx
+
+# ── 组件包导入 ──
+from provider_router import Router, RouterState, CircuitBreakerMonitor
+from provider_router.config import load_config as pr_load_config
+from fiber_tree import FiberTree, MemoryStorage
 
 # ── 路径 ──
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -70,6 +81,8 @@ _disabled_providers = set()     # 被自动或手动禁用的 provider
 _rate_limit_buckets = {}        # {provider_name: [t1, t2, ...]}
 _undo_stack = []                # 全局运行时逆栈：人类操作
 _dynamic_weights = {}           # {provider_name: effective_weight} 由熔断线程更新
+_quality_factors = {}           # {provider_name: float} 质量信誉因子（检查者评分驱动）
+_user_factors = {}              # {provider_name: float} 用户信誉因子（用户反馈驱动）
 _approval_cache = {}            # {(agent_id, action_hash): expiry_timestamp}
 _pending_approvals = {}         # {action_id: {action, params, agent_id}}
 _fibers = {}                    # {fiber_id: Fiber} — Agent 任务树
@@ -78,6 +91,17 @@ _lock = threading.Lock()
 _global_call_history = {}       # {f"{plugin_id}:{params_hash}": {"fiber_id": int, "timestamp": float, "result_preview": str}}
                                 # Root 级全局去重表，24h TTL，三层清理
 
+# ── 组件实例 ──
+_router_state = RouterState(
+    disabled_providers=_disabled_providers,
+    dynamic_weights=_dynamic_weights,
+    quality_factors=_quality_factors,
+    user_factors=_user_factors,
+    rate_limit_buckets=_rate_limit_buckets,
+    lock=_lock,
+)
+_fiber_tree = FiberTree()
+
 # ── 插件排队机制（v2.8） ──
 _serial_locks = {}              # {resource_lock_key: asyncio.Lock} — 串行锁池
 _throttle_windows = {}          # {plugin_id: [t1, t2, ...]} — 速率限制窗口
@@ -85,17 +109,7 @@ _throttle_windows = {}          # {plugin_id: [t1, t2, ...]} — 速率限制窗
 # ── 配置加载 ──
 def load_config(path=None):
     path = path or CONFIG_PATH
-    with open(path) as f:
-        cfg = yaml.safe_load(f)
-    # 解析 ${VAR} 环境变量引用
-    for pname, pcfg in cfg.get("providers", {}).items():
-        key = pcfg.get("api_key", "")
-        if isinstance(key, str) and key.startswith("${") and key.endswith("}"):
-            env_name = key[2:-1]
-            val = os.environ.get(env_name, "")
-            if val:
-                pcfg["api_key"] = val
-    return cfg
+    return pr_load_config(path)
 
 def reload_config():
     """重载 YAML 配置，同步运行时状态，清空运行时逆栈。
@@ -133,8 +147,17 @@ def get_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL,
         pool TEXT, provider TEXT, prompt_tokens INTEGER DEFAULT 0,
         completion_tokens INTEGER DEFAULT 0, ok INTEGER DEFAULT 1,
+        checker_score REAL DEFAULT NULL,
+        user_feedback INTEGER DEFAULT 0,
         called_at TEXT DEFAULT (datetime('now'))
     )""")
+    # v2.7 迁移：安全追加列（若缺失）
+    for col, col_type in [("checker_score", "REAL DEFAULT NULL"),
+                          ("user_feedback", "INTEGER DEFAULT 0")]:
+        try:
+            conn.execute(f"ALTER TABLE usage ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
     conn.execute("""CREATE TABLE IF NOT EXISTS health_log (
         model TEXT NOT NULL, pool TEXT, provider TEXT,
         ok INTEGER NOT NULL, latency_ms INTEGER DEFAULT 0,
@@ -159,58 +182,23 @@ def init_registry(cfg):
     conn.close()
 
 # ── 自动熔断 + 动态权重（后台线程，每 30s） ──
+_circuit_breaker = None  # 在 main() 中初始化
+
 def _circuit_breaker_loop(cfg):
-    """后台线程：滑动窗口错误率 >20% → 自动 disable，<10% → 恢复。
-    同时根据成功率更新动态权重。
-    """
-    while True:
-        time.sleep(30)
-        try:
-            conn = get_db()
-            rows = conn.execute("""
-                SELECT provider,
-                       COUNT(*) as total,
-                       SUM(ok) as success
-                FROM usage
-                WHERE called_at > datetime('now', '-5 minutes')
-                GROUP BY provider
-            """).fetchall()
-            conn.close()
-            now = time.time()
-            for r in rows:
-                name = r["provider"]
-                total = r["total"]
-                if total < 5:  # 样本不足，不动作
-                    continue
-                success = r["success"] or 0
-                err_rate = 1.0 - (success / total)
-                is_disabled = name in _disabled_providers
-
-                # 熔断：错误率 >20% → 自动禁用
-                if err_rate > 0.20 and not is_disabled:
-                    with _lock:
-                        _disabled_providers.add(name)
-                    undo_register(f"自动熔断禁用 {name} (err={err_rate:.0%})",
-                                  lambda n=name: _disabled_providers.discard(n))
-                    print(f"🔌 熔断: {name} 错误率 {err_rate:.0%} → 已禁用")
-
-                # 恢复：错误率 <10% 且是被熔断禁用的 → 自动恢复
-                elif err_rate < 0.10 and is_disabled:
-                    with _lock:
-                        _disabled_providers.discard(name)
-                    print(f"🔌 恢复: {name} 错误率 {err_rate:.0%} → 已启用")
-
-                # 动态权重：base_weight × (1 - err_rate)，保底 0.1
-                base = 1.0
-                for pc in cfg.get("pools", {}).values():
-                    for pv in pc.get("providers", []):
-                        if pv["name"] == name:
-                            base = pv.get("weight", 1.0)
-                            break
-                _dynamic_weights[name] = max(base * (1.0 - err_rate), 0.1)
-
-        except Exception as e:
-            print(f"⚠️ 熔断循环异常: {e}")
+    """后台线程 wrapper — 委托给 CircuitBreakerMonitor。"""
+    global _circuit_breaker
+    _circuit_breaker = CircuitBreakerMonitor(
+        get_db=get_db,
+        cfg_getter=lambda: _config,
+        disabled_providers=_disabled_providers,
+        dynamic_weights=_dynamic_weights,
+        quality_factors=_quality_factors,
+        user_factors=_user_factors,
+        undo_register=undo_register,
+        interval=30.0,
+        lock=_lock,
+    )
+    _circuit_breaker._loop()
 
 # ── 运行时逆栈（任务级幂等补偿） ──
 def undo_register(description, revert_callable):
@@ -498,58 +486,20 @@ def _format_string(template: str, params: dict) -> str:
 # ── 路由引擎 ──
 
 def find_model_config(cfg, model):
-    """遍历所有池查找 model 所属的 (pool_name, provider_config)"""
-    for pool_name, pool_cfg in cfg.get("pools", {}).items():
-        for pv in pool_cfg.get("providers", []):
-            if model in pv.get("models", []):
-                return pool_name, pool_cfg, pv
-    return None, None, None
+    """遍历所有池查找 model 所属的 (pool_name, provider_config, canonical_model_name)；大小写不敏感"""
+    return Router.find_model(cfg, model)
 
 def select_pool_by_keywords(cfg, messages_text):
     """关键词匹配 → 返回 pool_name 或 None"""
-    for rule in cfg.get("routing", {}).get("rules", []):
-        for kw in rule.get("keywords", []):
-            if kw in messages_text:
-                return rule["pool"]
-    return None
+    return Router.select_pool_by_keywords(cfg, messages_text)
 
 def select_provider_by_weight(providers, model=None):
-    """按权重随机选一个 provider，跳过禁用的；若指定 model 则只选有该模型的"""
-    candidates = [p for p in providers if p["name"] not in _disabled_providers]
-    if model:
-        candidates = [p for p in candidates if model in p.get("models", [])]
-    if not candidates:
-        return None
-    total = 0
-    weights = []
-    for p in candidates:
-        # 动态权重优先，无则用 YAML 静态权重
-        w = _dynamic_weights.get(p["name"]) or p.get("weight", 1)
-        w = max(w, 0.1)  # 保底
-        weights.append(w)
-        total += w
-    r = random.uniform(0, total)
-    upto = 0
-    for i, p in enumerate(candidates):
-        upto += weights[i]
-        if r <= upto:
-            return p
-    return candidates[-1]
+    """按权重随机选一个 provider，跳过禁用的；若指定 model 则只选有该模型的（大小写不敏感）"""
+    return Router.select_provider(providers, _router_state, model=model)
 
 def check_rate_limit(provider_name, max_rps):
     """滑动窗口限流，返回 True=通过 False=限流"""
-    if not max_rps or max_rps <= 0:
-        return True
-    now = time.time()
-    with _lock:
-        bucket = _rate_limit_buckets.setdefault(provider_name, [])
-        # 清理窗口外的记录
-        cutoff = now - 1.0
-        bucket[:] = [t for t in bucket if t > cutoff]
-        if len(bucket) >= max_rps:
-            return False
-        bucket.append(now)
-    return True
+    return Router.check_rate_limit(provider_name, max_rps, _router_state)
 
 def call_provider_http(provider_cfg, model, messages, stream=False, **kwargs):
     """调用后端 provider，返回 (status_code, body_bytes_or_str, latency_ms, error)"""
@@ -648,6 +598,13 @@ def cmd_usage(cfg):
         print(f"\n总计: {total['p']} prompt + {total['c']} completion = {total['p']+total['c']} tokens")
 
 # ── FastAPI 应用 ──
+def _get_provider_from_last_usage():
+    """返回最近一次调用使用的 provider 名（用于检查者评分关联）。"""
+    conn = get_db()
+    row = conn.execute("SELECT provider FROM usage ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    return row["provider"] if row else None
+
 def create_app(cfg):
     from fastapi import FastAPI, Request, HTTPException
     from fastapi.responses import JSONResponse, StreamingResponse, Response
@@ -896,17 +853,27 @@ def create_app(cfg):
         user_key = body.pop("api_key", None)
         kwargs = {k: v for k, v in body.items() if k not in ("model", "messages", "stream")}
 
-        # 1. 关键词路由（最高优先级）
-        messages_text = json.dumps(messages, ensure_ascii=False)
-        kw_pool = select_pool_by_keywords(cfg, messages_text)
-        pool_name = kw_pool
-        pool_cfg = None
+        # 1. 模型名精确匹配（大小写不敏感，优先级最高）
+        model_pool, pool_cfg, _, canonical_model = find_model_config(cfg, model)
+        if model_pool:
+            pool_name = model_pool
+            model = canonical_model
+            if not pool_cfg:
+                pool_cfg = cfg.get("pools", {}).get(pool_name)
+        else:
+            pool_name = None
+            pool_cfg = None
 
-        # 2. 模型名精确匹配
+        # 2. 关键词路由（仅当模型路由未命中时使用）
         if not pool_name:
-            pool_name, pool_cfg, _ = find_model_config(cfg, model)
-            if not pool_name:
-                pool_name = cfg.get("routing", {}).get("default_pool", "pool_a")
+            messages_text = json.dumps(messages, ensure_ascii=False)
+            kw_pool = select_pool_by_keywords(cfg, messages_text)
+            if kw_pool:
+                pool_name = kw_pool
+
+        # 3. 兜底默认池
+        if not pool_name:
+            pool_name = cfg.get("routing", {}).get("default_pool", "pool_a")
 
         # 3. 走故障转移链
         tried_pools = set()
@@ -951,7 +918,13 @@ def create_app(cfg):
             try:
                 async with httpx.AsyncClient(timeout=120) as client:
                     api = provider_cfg["api"].rstrip("/")
-                    req_body = {"model": model, "messages": messages, "stream": stream, **kwargs}
+                    # 用当前 provider 自己的模型名（大小写按 YAML 配置来）
+                    provider_model = model
+                    for m in pv.get("models", []):
+                        if m.lower() == model.lower():
+                            provider_model = m
+                            break
+                    req_body = {"model": provider_model, "messages": messages, "stream": stream, **kwargs}
                     resp = await client.post(
                         f"{api}/chat/completions",
                         json=req_body,
@@ -986,6 +959,7 @@ def create_app(cfg):
                     # 5xx → fallback 到下一个池
                     if status_code >= 500:
                         last_error = f"HTTP {status_code}"
+                        print(f"🔴 上游 {status_code}: {pv['name']} model={model}")
                         current_pool = pool_cfg.get("fallback")
                         continue
 
@@ -995,20 +969,69 @@ def create_app(cfg):
 
             except httpx.TimeoutException:
                 last_error = "timeout"
+                print(f"⏱️ 超时: {pv['name']} model={model} timeout=120s")
                 current_pool = pool_cfg.get("fallback")
                 continue
             except httpx.ConnectError:
                 last_error = "unreachable"
+                print(f"🔌 不可达: {pv['name']} api={provider_cfg.get('api','?')}")
                 current_pool = pool_cfg.get("fallback")
                 continue
             except Exception as e:
                 last_error = str(e)
+                print(f"⚠️ 请求异常: {pv['name']} model={model} error={e}")
                 current_pool = pool_cfg.get("fallback")
                 continue
 
         app.state.req_counter.labels(pool=pool_name, provider=used_provider or "none", status="503").inc()
         app.state.req_duration.labels(provider=used_provider or "none").observe(time.time() - t0)
         raise HTTPException(status_code=503, detail=f"all pools exhausted: {last_error}")
+
+    # ── 直连端点：不走池路由、关键词匹配、故障转移 ──
+    @app.post("/v1/direct/chat/completions")
+    async def direct_chat_completions(request: Request):
+        """直接调用指定 provider，不走任何路由逻辑。
+
+        请求体与 /v1/chat/completions 相同，额外支持:
+        - `_provider`: 指定 provider 名称（如 scnet-tp、deepseek-direct），可选
+        - 若不指定，自动从 model 名查找所属 provider
+        """
+        t0 = time.time()
+        body = await request.json()
+        model = body.get("model", "DeepSeek-V4-Flash")
+        messages = body.get("messages", [])
+        stream = body.get("stream", False)
+        kwargs = {k: v for k, v in body.items() if k not in ("model", "messages", "stream", "_provider")}
+
+        direct_provider_name = body.get("_provider")
+        if not direct_provider_name:
+            # 自动从 model 名查找第一个匹配的 provider
+            _, _, pv, m = find_model_config(cfg, model)
+            if pv:
+                direct_provider_name = pv["name"]
+                model = m
+            if not direct_provider_name:
+                raise HTTPException(status_code=400, detail=f"model '{model}' not found in any provider")
+
+        provider_cfg = cfg.get("providers", {}).get(direct_provider_name)
+        if not provider_cfg or not provider_cfg.get("api_key", "") or provider_cfg["api_key"].startswith("${"):
+            raise HTTPException(status_code=400, detail=f"provider '{direct_provider_name}' not configured or key not resolved")
+        api = provider_cfg["api"].rstrip("/")
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            req_body = {"model": model, "messages": messages, "stream": stream, **kwargs}
+            resp = await client.post(
+                f"{api}/chat/completions",
+                json=req_body,
+                headers={"Authorization": f"Bearer {provider_cfg['api_key']}"},
+            )
+
+        if stream:
+            return StreamingResponse(resp.aiter_bytes(), media_type="text/event-stream", status_code=resp.status_code)
+
+        app.state.req_counter.labels(pool="direct", provider=direct_provider_name, status=str(resp.status_code)).inc()
+        app.state.req_duration.labels(provider=direct_provider_name).observe(time.time() - t0)
+        return Response(content=resp.text, status_code=resp.status_code, media_type="application/json")
 
     # ── Prometheus 指标（模块级，避免重复注册） ──
     _prometheus_registered = False
@@ -1142,6 +1165,38 @@ def create_app(cfg):
         }
 
     # ── Fiber 树形上下文 API（Agent 任务级可逆） ──
+    @app.post("/admin/feedback")
+    async def admin_feedback(request: Request):
+        """用户反馈端点。
+        请求体: {"fiber_id": 1, "feedback": 1, "modified_text": "..."}
+        feedback: 1=点赞/采纳，-1=点踩/修改建议
+        """
+        body = await request.json()
+        feedback = body.get("feedback")
+        if feedback not in (1, -1):
+            raise HTTPException(status_code=400, detail="feedback must be 1 or -1")
+        # 找到与 fiber 关联的 provider 最近一条 usage
+        provider = _get_provider_from_last_usage()
+        if not provider:
+            raise HTTPException(status_code=404, detail="no usage record found")
+        conn = get_db()
+        conn.execute(
+            "UPDATE usage SET user_feedback = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY called_at DESC LIMIT 1)",
+            (feedback, provider))
+        conn.commit()
+        conn.close()
+        # 实时更新用户因子（不等30秒循环）
+        qf_cfg = cfg.get("quality_feedback", {}).get("user_window", 20)
+        conn2 = get_db()
+        urows = conn2.execute(
+            "SELECT user_feedback FROM usage WHERE provider = ? AND user_feedback != 0 ORDER BY called_at DESC LIMIT ?",
+            (provider, qf_cfg)
+        ).fetchall()
+        conn2.close()
+        total = sum(r[0] for r in urows)
+        _user_factors[provider] = max(0.5, min(1.5, 1.0 + total * 0.1))
+        return {"status": "ok", "provider": provider, "user_factor": _user_factors[provider]}
+
     @app.post("/admin/fiber/create")
     async def admin_fiber_create(request: Request):
         body = await request.json()
@@ -1223,10 +1278,24 @@ def create_app(cfg):
         return result
 
     @app.post("/admin/fiber/{fiber_id}/commit")
-    async def admin_fiber_commit(fiber_id: int):
+    async def admin_fiber_commit(fiber_id: int, request: Request):
+        body = await request.json() if request.headers.get("content-type") == "application/json" else {}
         ok = fiber_commit(fiber_id)
         if not ok:
             raise HTTPException(status_code=409, detail=f"fiber {fiber_id} cannot commit: not active or children incomplete")
+        # v2.7：检查者提交评分——若检查者 fiber 提交时携带 score，写入最近一条 usage 记录
+        score = body.get("score")
+        if score is not None:
+            f = _fibers.get(fiber_id)
+            if f and f.parent_id is not None:
+                provider = _get_provider_from_last_usage()
+                if provider:
+                    conn = get_db()
+                    conn.execute(
+                        "UPDATE usage SET checker_score = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY called_at DESC LIMIT 1)",
+                        (score, provider))
+                    conn.commit()
+                    conn.close()
         return {"fiber_id": fiber_id, "status": "committed"}
 
     @app.get("/admin/fiber/tree")
@@ -1831,6 +1900,257 @@ def create_app(cfg):
 
     return app
 
+# ── 反向依赖检查 ──
+
+def _collect_all_keys(config):
+    """从 config 中提取所有 Key（gateway_key + 各 provider 的 api_key + 外部 URL）。"""
+    keys = {}
+    gw_key = config.get("gateway_key", "")
+    if gw_key:
+        keys["gateway_key"] = gw_key
+        # 外部组件可能去掉前缀（如 `gw-`），添加变体
+        for prefix in ("gw-", "gw_", "hermes-", "hermes_"):
+            if gw_key.startswith(prefix):
+                variant = gw_key[len(prefix):]
+                keys[f"gateway_key_variant.{prefix}"] = variant
+                break
+    for pname, pcfg in config.get("providers", {}).items():
+        ak = pcfg.get("api_key", "")
+        if ak and not ak.startswith("${"):
+            keys[f"providers.{pname}.api_key"] = ak
+        # 也记录 provider 的 api_base URL，外部组件可能引用它
+        api = pcfg.get("api", "")
+        if api:
+            keys[f"providers.{pname}.api"] = api
+    # 添加本机地址/端口，外部组件可能引用
+    host = config.get("host", "127.0.0.1")
+    port = config.get("port", 8646)
+    keys["_self_url"] = f"http://{host}:{port}"
+    # 也添加可能的公网地址（nginx 暴露的端口和域名）
+    keys["_self_url_https"] = "https://117.72.220.114:8643"
+    keys["_self_url_domain"] = "https://hermes.jiangnande.cloud:8643"
+    return keys
+
+
+def _scan_local(index, config):
+    """扫描本地依赖：.env, 已知 Agent 配置文件, 环境变量。"""
+    # 1. 检查 .env 文件中的环境变量引用
+    env_path = os.path.join(BASE, ".env")
+    if os.path.isfile(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                for key_name, key_val in config.items():
+                    if key_val in v:
+                        index.append({
+                            "component": "本机 .env",
+                            "file": env_path,
+                            "key_name": key_name,
+                            "current_value": key_val,
+                            "found_at": f"{k} = {v[:60]}",
+                            "fixable": True,
+                            "fix_type": "sed",
+                        })
+
+    # 2. OpenHands 配置（~/.config/oh/config.toml 或 ~/.openhands/config.toml）
+    oh_paths = [
+        os.path.expanduser("~/.openhands/config.toml"),
+        os.path.expanduser("~/.config/oh/config.toml"),
+    ]
+    for oh_path in oh_paths:
+        if os.path.isfile(oh_path):
+            with open(oh_path) as f:
+                content = f.read()
+                for key_name, key_val in config.items():
+                    if key_val in content:
+                        index.append({
+                            "component": "OpenHands",
+                            "file": oh_path,
+                            "key_name": key_name,
+                            "current_value": key_val,
+                            "found_at": f"配置文件中引用",
+                            "fixable": True,
+                            "fix_type": "sed",
+                        })
+
+    # 3. 环境变量（检查进程环境）
+    for key_name, key_val in config.items():
+        for env_name, env_val in sorted(os.environ.items()):
+            if key_val == env_val or (key_val and key_val in env_val):
+                if env_name in ("XIAOMI_API_KEY", "DEEPSEEK_API_KEY", "OPENHANDS_API_KEY", "GATEWAY_KEY"):
+                    index.append({
+                        "component": f"环境变量 {env_name}",
+                        "file": "进程环境变量",
+                        "key_name": key_name,
+                        "current_value": key_val,
+                        "found_at": f"{env_name} = {env_val[:60]}",
+                        "fixable": False,
+                        "fix_type": "env",
+                    })
+
+
+def _scan_remote(host, port, cmd, config, label):
+    """通过 SSH 在远程主机上扫描 Key 引用。"""
+    try:
+        full_cmd = f'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 -p {port} root@{host} {shlex.quote(cmd)}'
+        result = subprocess.run(full_cmd, shell=True, capture_output=True, timeout=15, text=True)
+        if result.returncode != 0:
+            return []
+        content = result.stdout
+        hits = []
+        for key_name, key_val in config.items():
+            if key_val in content:
+                # 尝试定位行号
+                for i, line in enumerate(content.split("\n"), 1):
+                    if key_val in line:
+                        hits.append({
+                            "component": label,
+                            "file": f"{host}:{port} — 远程配置",
+                            "key_name": key_name,
+                            "current_value": key_val,
+                            "found_at": f"第 {i} 行: {line.strip()[:80]}",
+                            "fixable": True,
+                            "fix_type": "ssh_sed",
+                            "_remote": {
+                                "host": host,
+                                "port": port,
+                                "file": cmd.split("cat ")[-1] if "cat " in cmd else "",
+                            },
+                        })
+                        break
+        return hits
+    except Exception as e:
+        return [{"component": label, "file": f"{host}:{port}", "key_name": "—",
+                 "current_value": "—", "found_at": f"SSH 连接失败: {e}",
+                 "fixable": False, "fix_type": "unreachable"}]
+
+
+def cmd_check_deps(config, target_key=None, auto_sync=False):
+    """check-deps 命令：反向依赖扫描 + 可选自动同步。"""
+    all_keys = _collect_all_keys(config)
+    if target_key:
+        # 过滤：只保留匹配目标值的 key
+        filtered = {}
+        for kn, kv in all_keys.items():
+            if target_key in kv or target_key in kn:
+                filtered[kn] = kv
+        if not filtered:
+            print(f"🔍 未找到匹配 '{target_key}' 的 Key")
+            return
+        all_keys = filtered
+
+    print(f"\n🔍 反向依赖扫描 — 共 {len(all_keys)} 个配置项\n")
+    for kn, kv in all_keys.items():
+        if kn.startswith("_"):
+            continue  # 内部标记不展示
+        print(f"  📌 {kn}: {kv[:60]}...")
+    print()
+
+    # 收集所有依赖
+    index = []
+    _scan_local(index, all_keys)
+    # 远程扫描
+    index += _scan_remote("106.14.40.189", "2222",
+                          "cat /opt/qq-bot/bot/astrbot/data/cmd_config.json",
+                          all_keys, "AstrBot（老机）")
+    index += _scan_remote("106.14.20.149", "2222",
+                          "cat /opt/kb-agent/config.json 2>/dev/null || cat /app/config.json 2>/dev/null || echo 'NO_CONFIG'",
+                          all_keys, "kb_agent（新机）")
+
+    if not index:
+        print("✅ 未发现任何外部依赖，配置变更安全。")
+        return
+
+    # 分组展示
+    fixable_deps = [d for d in index if d.get("fixable")]
+    unfixable_deps = [d for d in index if not d.get("fixable")]
+
+    if unfixable_deps:
+        print("⚠️  以下依赖无法自动修复：\n")
+        for d in unfixable_deps:
+            print(f"   ❌ {d['component']}")
+            print(f"      {d['found_at']}")
+        print()
+
+    if fixable_deps:
+        print(f"🔧 以下 {len(fixable_deps)} 个依赖可自动同步：\n")
+        for d in fixable_deps:
+            print(f"   📎 {d['component']} ({d['file']})")
+            print(f"      {d['found_at']}")
+        print()
+
+    # auto-sync 逻辑
+    if auto_sync and fixable_deps:
+        print("=" * 50)
+        print("🔄 自动同步模式启用\n")
+        failed = False
+        for d in fixable_deps:
+            if d["fix_type"] == "sed" and os.path.isfile(d["file"]):
+                # 本地文件：备份 + sed 替换
+                old_val = d["current_value"]
+                new_val = all_keys.get(d["key_name"], "")
+                if not new_val:
+                    continue
+                bak = d["file"] + ".bak"
+                try:
+                    subprocess.run(f"cp {d['file']} {bak}", shell=True, capture_output=True, timeout=5)
+                    # 用 sed 替换
+                    esc_old = old_val.replace("/", "\\/").replace("'", "'\\''")
+                    esc_new = new_val.replace("/", "\\/").replace("'", "'\\''")
+                    r = subprocess.run(
+                        f"sed -i 's/{esc_old}/{esc_new}/g' {d['file']}",
+                        shell=True, capture_output=True, timeout=10, text=True)
+                    if r.returncode == 0:
+                        print(f"   ✅ {d['component']} — 已同步")
+                    else:
+                        print(f"   ❌ {d['component']} — sed 失败: {r.stderr[:80]}")
+                        failed = True
+                except Exception as e:
+                    print(f"   ❌ {d['component']} — 异常: {e}")
+                    failed = True
+
+            elif d["fix_type"] == "ssh_sed" and d.get("_remote"):
+                # 远程文件：SSH + sed 替换
+                rhost = d["_remote"]["host"]
+                rport = d["_remote"]["port"]
+                rfile = d["_remote"]["file"]
+                old_val = d["current_value"]
+                new_val = all_keys.get(d["key_name"], "")
+                if not new_val or not rfile:
+                    continue
+                esc_old = old_val.replace("/", "\\/").replace("'", "'\\''")
+                esc_new = new_val.replace("/", "\\/").replace("'", "'\\''")
+                try:
+                    # 先备份
+                    bak_cmd = f"ssh -o StrictHostKeyChecking=no -p {rport} root@{rhost} 'cp {rfile} {rfile}.depsync.bak' 2>/dev/null"
+                    subprocess.run(bak_cmd, shell=True, capture_output=True, timeout=10)
+                    # 再替换
+                    sed_cmd = shlex.quote(f"sed -i 's/{esc_old}/{esc_new}/g' {rfile}")
+                    full = f"ssh -o StrictHostKeyChecking=no -p {rport} root@{rhost} {sed_cmd}"
+                    r = subprocess.run(full, shell=True, capture_output=True, timeout=15, text=True)
+                    if r.returncode == 0:
+                        print(f"   ✅ {d['component']} ({rhost}) — 已同步")
+                    else:
+                        print(f"   ❌ {d['component']} ({rhost}) — 同步失败: {r.stderr[:80]}")
+                        failed = True
+                except Exception as e:
+                    print(f"   ❌ {d['component']} ({rhost}) — 异常: {e}")
+                    failed = True
+
+        if failed:
+            print("\n   ❌ 部分依赖同步失败，请检查日志。")
+        else:
+            print("\n   ✅ 所有依赖已更新，变更安全。")
+
+    elif auto_sync and not fixable_deps:
+        print("🔄 没有可自动修复的依赖。")
+
+    print()
+
+
 # ── 主入口 ──
 def main():
     global _config
@@ -1902,6 +2222,48 @@ def main():
 
     elif args[0] == "usage":
         cmd_usage(_config)
+
+    elif args[0] == "quality":
+        """查看每个 Provider 的质量排名（基于检查者评分）。"""
+        conn = get_db()
+        rows = conn.execute("""
+            SELECT provider, COUNT(*) as n, ROUND(AVG(checker_score), 1) as avg_score
+            FROM usage WHERE checker_score IS NOT NULL
+            GROUP BY provider ORDER BY avg_score DESC
+        """).fetchall()
+        conn.close()
+        if not rows:
+            print("暂无检查者评分数据")
+        else:
+            print(f"\n📊 质量排名（检查者评分）")
+            print(f"  {'Provider':<20s} {'样本数':>6s} {'平均分':>6s}")
+            print(f"  {'─'*35}")
+            for r in rows:
+                print(f"  {r['provider']:<20s} {r['n']:>6d} {r['avg_score']:>6.1f}")
+            print()
+
+    elif args[0] == "feedback-stats":
+        """查看每个 Provider 的用户反馈统计。"""
+        conn = get_db()
+        rows = conn.execute("""
+            SELECT provider,
+                   COUNT(*) as n,
+                   SUM(CASE WHEN user_feedback=1 THEN 1 ELSE 0 END) as likes,
+                   SUM(CASE WHEN user_feedback=-1 THEN 1 ELSE 0 END) as dislikes
+            FROM usage WHERE user_feedback != 0
+            GROUP BY provider ORDER BY (likes - dislikes) DESC
+        """).fetchall()
+        conn.close()
+        if not rows:
+            print("暂无用户反馈数据")
+        else:
+            print(f"\n👍 用户反馈统计")
+            print(f"  {'Provider':<20s} {'样本':>4s} {'点赞':>4s} {'点踩':>4s} {'净分':>5s}")
+            print(f"  {'─'*42}")
+            for r in rows:
+                net = r["likes"] - r["dislikes"]
+                print(f"  {r['provider']:<20s} {r['n']:>4d} {r['likes']:>4d} {r['dislikes']:>4d} {net:>+4d}")
+            print()
 
     elif args[0] == "git-log":
         subprocess.run(["git", "log", "--oneline", "-20"], cwd=BASE)
@@ -1988,6 +2350,17 @@ def main():
                             _print_tree(int(fid))
         except Exception as e:
             print(f"❌ 调用失败: {e}")
+
+    elif args[0] == "check-deps":
+        """检查 Key 的反向依赖：扫描所有已知组件，找出哪些引用了指定 Key（或全部 Key）。"""
+        target_key = None
+        auto_sync = False
+        for a in args[1:]:
+            if a == "--auto-sync":
+                auto_sync = True
+            elif not a.startswith("--"):
+                target_key = a
+        cmd_check_deps(_config, target_key=target_key, auto_sync=auto_sync)
 
     elif args[0] == "scan-agents":
         """自动发现并接入智能体。
