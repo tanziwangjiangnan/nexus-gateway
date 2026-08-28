@@ -1,4 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# Local config (contains real API keys)
+gateway.yaml
 gateway.db
 gateway.pid
-__pycache__/
-*.pyc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+logs/
+tmp/
+*.log
+
+# OpenHands agent memory (local only)
+.openhands/
