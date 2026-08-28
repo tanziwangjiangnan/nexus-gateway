@@ -1,0 +1,14 @@
+[project]
+name = "hermes-ops"
+version = "3.3.0"
+description = "Hermes Ops — CLI 操作命令 + 健康探测 + 反向依赖检查 + 智能体发现"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "hermes-cfg",
+    "PyYAML",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"

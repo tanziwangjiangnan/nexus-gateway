@@ -1,0 +1,14 @@
+[project]
+name = "hermes-cfg"
+version = "3.0.0"
+description = "Hermes Config — 配置加载（ConfigLoader + DB 初始化 + registry）"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "hermes-provider-router",
+    "PyYAML",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"

@@ -1,0 +1,11 @@
+[project]
+name = "hermes-provider-router"
+version = "2.9.0"
+description = "Hermes Provider Router — 模型池路由引擎 + 熔断 + 限流 + 动态权重"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"

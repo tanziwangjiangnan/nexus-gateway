@@ -1,0 +1,11 @@
+[project]
+name = "hermes-fiber-tree"
+version = "2.9.0"
+description = "Hermes FiberTree — 知识图谱存储抽象（FiberTree + Storage + MemoryStorage + SQLiteStorage）"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"

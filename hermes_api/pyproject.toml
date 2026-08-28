@@ -1,0 +1,18 @@
+[project]
+name = "hermes-api"
+version = "3.2.0"
+description = "Hermes API — FastAPI 应用构建器（build_app + 依赖注入），27 个路由"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "hermes-provider-router",
+    "hermes-cfg",
+    "hermes-fiber",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
