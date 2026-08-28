@@ -20,8 +20,16 @@
 - v2.8: 跨分支全局去重（`_global_call_history` + 三层清理）+ 插件排队（serial/throttle 并发控制）
 - v2.9: 组件打包——`provider_router/` 和 `fiber_tree/` 独立包，`gateway.py` 导入适配，示例编写并验证
 - v2.10: 接口设计缺陷修复——FiberTree 无状态重构（移除 `_fibers` 类变量和单例）；Storage 抽象完善（`add_global_call_history` / `get_global_call_history` 方法）；Provider Router 可扩展钩子（`select_provider(weight_fn=...)`、`CircuitBreakerMonitor(quality_factor_fn=..., user_factor_fn=..., error_threshold=..., recover_threshold=...)`）
+- v2.11: 反向依赖检查 `check-deps` 命令（Key/URL 被哪些组件引用 + `--auto-sync` 远程同步）
+- v3.0: 拆分 `hermes_cfg/` 配置管理包（原 config_manager 因 PyPI 包名冲突更名）；ConfigLoader 类 + get_db + init_registry
 
 ## 组件导出接口
+
+### `hermes_cfg/`（v3.0，原 config_manager 更名）
+- `ConfigLoader`（load/reload + on_reload 回调）
+- `get_db()`（SQLite WAL，建表 + 列迁移）
+- `init_registry()`
+- **命名规则**: 所有 hermes 组件统一用 `hermes_*` 前缀，避免与 PyPI 包名冲突
 
 ### `provider_router/`
 - `Router`（静态方法：`find_model`, `select_pool_by_keywords`, `select_provider(weight_fn=...)`, `check_rate_limit`）
