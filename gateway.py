@@ -66,6 +66,7 @@ import httpx
 from provider_router import Router, RouterState, CircuitBreakerMonitor
 from fiber_tree import FiberTree, MemoryStorage
 from hermes_cfg import ConfigLoader, get_db, init_registry
+from hermes_fiber import FiberRuntime
 
 # ── 路径 ──
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -78,17 +79,13 @@ QQ_TARGET = "1310893084"
 _config = {}                    # 当前配置
 _disabled_providers = set()     # 被自动或手动禁用的 provider
 _rate_limit_buckets = {}        # {provider_name: [t1, t2, ...]}
-_undo_stack = []                # 全局运行时逆栈：人类操作
 _dynamic_weights = {}           # {provider_name: effective_weight} 由熔断线程更新
 _quality_factors = {}           # {provider_name: float} 质量信誉因子（检查者评分驱动）
 _user_factors = {}              # {provider_name: float} 用户信誉因子（用户反馈驱动）
 _approval_cache = {}            # {(agent_id, action_hash): expiry_timestamp}
 _pending_approvals = {}         # {action_id: {action, params, agent_id}}
-_fibers = {}                    # {fiber_id: Fiber} — Agent 任务树
-_next_fiber_id = 0
 _lock = threading.Lock()
-_global_call_history = {}       # {f"{plugin_id}:{params_hash}": {"fiber_id": int, "timestamp": float, "result_preview": str}}
-                                # Root 级全局去重表，24h TTL，三层清理
+_fiber_runtime = FiberRuntime(lock=_lock)  # 运行时 Fiber + undo + 全局去重
 
 # ── 组件实例 ──
 _router_state = RouterState(
@@ -158,188 +155,47 @@ def _circuit_breaker_loop(cfg):
     )
     _circuit_breaker._loop()
 
-# ── 运行时逆栈（任务级幂等补偿） ──
+# ── 运行时逆栈（任务级幂等补偿，委托给 hermes_fiber） ──
 def undo_register(description, revert_callable):
     """注册运行时操作的撤销回调。每个原子操作应有对应的逆操作。"""
-    _undo_stack.append((description, revert_callable))
+    _fiber_runtime.undo_register(description, revert_callable)
 
 def undo_pop():
     """弹出并执行最后一条撤销回调。"""
-    if not _undo_stack:
-        return False, "undo_stack 为空"
-    desc, fn = _undo_stack.pop()
-    try:
-        fn()
-        return True, f"已撤销: {desc}"
-    except Exception as e:
-        _undo_stack.append((desc, fn))  # 失败放回，留给重试
-        return False, f"撤销失败 ({desc}): {e}"
+    return _fiber_runtime.undo_pop()
 
 def undo_clear(reason=""):
     """清空全局逆栈（配置热加载时调用，因为新配置是新起点）。"""
-    _undo_stack.clear()
+    _fiber_runtime.undo_clear(reason)
 
-# ── Fiber 树形上下文（Agent 任务级可逆） ──
-import dataclasses
-
-@dataclasses.dataclass
-class Fiber:
-    """任务光纤。每棵 fiber 树对应一个统筹 Agent 的任务。
-    - 子 fiber 失败时级联回滚祖先
-    - undo_log 是 fiber 本地逆栈，提交时合并到父 fiber 或全局栈
-    - capabilities 声明此 fiber 的权限（执行者: write/execute, 检查者: read/validate/inspect）
-    - call_history 记录本 fiber 及其父 fiber 已调用的 (plugin_id, params_hash)，用于重复调用拦截
-    """
-    id: int
-    parent_id: int | None
-    agent_id: str
-    description: str
-    status: str = "active"       # active | committed | failed
-    undo_log: list = dataclasses.field(default_factory=list)  # [(desc, callable), ...]
-    children: list = dataclasses.field(default_factory=list)  # [fiber_id, ...]
-    capabilities: list = dataclasses.field(default_factory=list)  # ["read", "write", "validate", "inspect", "execute"]
-    call_history: list = dataclasses.field(default_factory=list)  # [{"plugin_id": str, "params_hash": str, "time": float}, ...]
-    created_at: float = dataclasses.field(default_factory=time.time)
-
+# ── Fiber 树形上下文（Agent 任务级可逆，委托给 hermes_fiber） ──
 def fiber_create(agent_id, description, parent_id=None, capabilities=None):
-    """创建新 fiber。返回 fiber_id。
-    capabilities 可选，用于执行者-检查者权限校验：
-    - 检查者只能有 read/validate/inspect
-    - 执行者可以有 write/execute
-    """
-    global _next_fiber_id
-    with _lock:
-        _next_fiber_id += 1
-        fid = _next_fiber_id
-        f = Fiber(id=fid, parent_id=parent_id, agent_id=agent_id, description=description)
-        if capabilities:
-            f.capabilities = capabilities
-        _fibers[fid] = f
-        if parent_id is not None and parent_id in _fibers:
-            _fibers[parent_id].children.append(fid)
-        return fid
+    return _fiber_runtime.fiber_create(agent_id, description, parent_id, capabilities)
 
 def fiber_register(fiber_id, description, revert_callable):
-    """向 fiber 注册撤销操作。若 fiber 已终止则拒绝。"""
-    f = _fibers.get(fiber_id)
-    if not f:
-        return False
-    if f.status != "active":
-        return False
-    f.undo_log.append((description, revert_callable))
-    return True
+    return _fiber_runtime.fiber_register(fiber_id, description, revert_callable)
 
 def fiber_fail(fiber_id, cascade_parent=True):
-    """失败 fiber：LIFO 回滚自己的 undo_log，然后递归失败所有子 fiber。
-    若 cascade_parent=True 且此 fiber 有父节点，级联失败父 fiber（执行者-检查者模式：
-    检查者不通过 → 自动回滚执行者所有操作）。
-    返回 (ok, 操作列表)。
-    """
-    f = _fibers.get(fiber_id)
-    if not f or f.status != "active":
-        return False, []
-    # 先递归失败子 fiber
-    for child_id in list(f.children):
-        fiber_fail(child_id, cascade_parent=False)
-    # LIFO 回滚自己的 undo_log
-    ops = []
-    while f.undo_log:
-        desc, fn = f.undo_log.pop()
-        try:
-            fn()
-            ops.append(f"回滚: {desc}")
-        except Exception as e:
-            ops.append(f"回滚失败 ({desc}): {e}")
-    f.status = "failed"
-    # 级联失败父 fiber（检查者不通过 → 执行者回滚）
-    if cascade_parent and f.parent_id is not None and f.parent_id in _fibers:
-        parent = _fibers[f.parent_id]
-        if parent.status == "active":
-            _, parent_ops = fiber_fail(f.parent_id, cascade_parent=False)
-            ops.extend(parent_ops)
-    return True, ops
+    return _fiber_runtime.fiber_fail(fiber_id, cascade_parent)
 
 def fiber_commit(fiber_id):
-    """提交 fiber：合并 undo_log 到父 fiber（或全局栈），标记 committed。"""
-    f = _fibers.get(fiber_id)
-    if not f or f.status != "active":
-        return False
-    # 所有子 fiber 必须已终止
-    for child_id in f.children:
-        child = _fibers.get(child_id)
-        if child and child.status == "active":
-            return False  # 有未完成的子 fiber
-        if child and child.status == "failed":
-            return False  # 子 fiber 已失败，父不能提交
-    # 合并到父 fiber 或全局栈
-    if f.parent_id is not None and f.parent_id in _fibers:
-        parent = _fibers[f.parent_id]
-        if parent.status == "active":
-            parent.undo_log.extend(f.undo_log)
-    else:
-        _undo_stack.extend(f.undo_log)
-    f.undo_log.clear()
-    f.status = "committed"
-    # 主动清理：该 fiber 下所有 call_history 条目从全局表删除
-    _cleanup_global_history_for_fiber(fiber_id)
-    return True
+    return _fiber_runtime.fiber_commit(fiber_id)
 
+# ── Root 级全局去重表（v2.8，委托给 hermes_fiber） ──
+def _global_call_lookup(plugin_id, params_hash):
+    return _fiber_runtime.global_call_lookup(plugin_id, params_hash)
 
-# ── Root 级全局去重表（v2.8） ──
-_GLOBAL_HISTORY_TTL = 86400  # 24 小时
+def _global_call_add(plugin_id, params_hash, fiber_id, result_preview=""):
+    _fiber_runtime.global_call_add(plugin_id, params_hash, fiber_id, result_preview)
 
-def _global_call_key(plugin_id: str, params_hash: str) -> str:
-    return f"{plugin_id}:{params_hash}"
+def _global_call_remove(plugin_id, params_hash):
+    _fiber_runtime.global_call_remove(plugin_id, params_hash)
 
-def _global_call_lookup(plugin_id: str, params_hash: str) -> dict | None:
-    """惰性清理：查找全局去重表，命中但超时则删除并返回 None。"""
-    key = _global_call_key(plugin_id, params_hash)
-    entry = _global_call_history.get(key)
-    if entry is None:
-        return None
-    now = time.time()
-    if now - entry["timestamp"] > _GLOBAL_HISTORY_TTL:
-        del _global_call_history[key]
-        return None
-    return entry
-
-def _global_call_add(plugin_id: str, params_hash: str, fiber_id: int, result_preview: str = ""):
-    """写入全局去重表。"""
-    key = _global_call_key(plugin_id, params_hash)
-    _global_call_history[key] = {
-        "fiber_id": fiber_id,
-        "timestamp": time.time(),
-        "result_preview": result_preview[:200],
-    }
-
-def _global_call_remove(plugin_id: str, params_hash: str):
-    """从全局去重表删除单条记录。"""
-    key = _global_call_key(plugin_id, params_hash)
-    _global_call_history.pop(key, None)
-
-def _cleanup_global_history_for_fiber(fiber_id: int):
-    """主动清理：遍历 fiber 及其子树，删除所有 call_history 对应的全局表条目。"""
-    f = _fibers.get(fiber_id)
-    if not f:
-        return
-    # 清理本 fiber 的 call_history
-    for entry in f.call_history:
-        _global_call_remove(entry["plugin_id"], entry["params_hash"])
-    # 递归清理子 fiber
-    for child_id in list(f.children):
-        _cleanup_global_history_for_fiber(child_id)
+def _cleanup_global_history_for_fiber(fiber_id):
+    _fiber_runtime._cleanup_global_history_for_fiber(fiber_id)
 
 def _cleanup_global_history_periodic():
-    """定时清理：后台线程每 1 小时扫描，删除超时条目。"""
-    while True:
-        time.sleep(3600)
-        now = time.time()
-        expired = [k for k, v in _global_call_history.items()
-                   if now - v["timestamp"] > _GLOBAL_HISTORY_TTL]
-        for k in expired:
-            _global_call_history.pop(k, None)
-        if expired:
-            print(f"[全局去重] 定时清理 {len(expired)} 条过期记录")
+    _fiber_runtime.cleanup_global_history_periodic()
 
 
 # ── 插件执行器（v2.8 排队用） ──
@@ -1066,7 +922,7 @@ def create_app(cfg):
 
     @app.get("/admin/undo-list")
     async def admin_undo_list():
-        return {"stack": [desc for desc, _ in _undo_stack]}
+        return {"stack": _fiber_runtime.undo_list()}
 
     # ── MCP 审批回调 ──
     # 让统筹 Agent 通过 HTTP 调用 toggle，走审批缓存 + fiber 树形上下文
@@ -1191,7 +1047,7 @@ def create_app(cfg):
             parent_id=body.get("parent_id"),
             capabilities=capabilities,
         )
-        f = _fibers[fid]
+        f = _fiber_runtime.fiber_get(fid)
         return {"fiber_id": fid, "parent_id": f.parent_id, "status": f.status, "description": f.description, "capabilities": capabilities}
 
     @app.post("/admin/fiber/{fiber_id}/fail")
@@ -1206,7 +1062,7 @@ def create_app(cfg):
         if evidence:
             result["evidence"] = evidence
         # 自动收集检查者日志（如果此 fiber 是检查者节点）
-        f = _fibers.get(fiber_id)
+        f = _fiber_runtime.fiber_get(fiber_id)
         if f and f.agent_id and "checker" in f.agent_id.lower():
             try:
                 evidence_logs = []
@@ -1244,7 +1100,7 @@ def create_app(cfg):
         # v2.7：检查者提交评分——若检查者 fiber 提交时携带 score，写入最近一条 usage 记录
         score = body.get("score")
         if score is not None:
-            f = _fibers.get(fiber_id)
+            f = _fiber_runtime.fiber_get(fiber_id)
             if f and f.parent_id is not None:
                 provider = _get_provider_from_last_usage()
                 if provider:
@@ -1272,7 +1128,7 @@ def create_app(cfg):
                 "call_history": f.call_history,
                 "created_at": datetime.datetime.fromtimestamp(f.created_at).isoformat(),
             }
-        return {"fibers": {fid: _serialize(f) for fid, f in sorted(_fibers.items())}}
+        return {"fibers": {fid: _serialize(f) for fid, f in sorted(_fiber_runtime.fiber_all().items())}}
 
     # ── 智能体声明式接入 ──
     @app.get("/admin/agents/declaration")
@@ -1538,7 +1394,7 @@ def create_app(cfg):
         confidence = body.get("confidence", 1.0)
 
         # 校验执行者 fiber 存在
-        if executor_fiber_id is not None and executor_fiber_id not in _fibers:
+        if executor_fiber_id is not None and executor_fiber_id not in _fiber_runtime.fiber_all():
             raise HTTPException(status_code=404, detail=f"executor fiber {executor_fiber_id} not found")
 
         # 根据 validation mode 判断是否需要检查
@@ -1717,10 +1573,10 @@ def create_app(cfg):
 
         # 记录本次调用到 fiber 的 call_history
         call_entry = {"plugin_id": plugin_id, "params_hash": params_hash, "time": time.time()}
-        if fid in _fibers:
-            _fibers[fid].call_history.append(call_entry)
-        if fiber_id is not None and fiber_id in _fibers:
-            _fibers[fiber_id].call_history.append(call_entry)
+        if fid in _fiber_runtime.fiber_all():
+            _fiber_runtime.fiber_get(fid).call_history.append(call_entry)
+        if fiber_id is not None and fiber_id in _fiber_runtime.fiber_all():
+            _fiber_runtime.fiber_get(fiber_id).call_history.append(call_entry)
 
         # 6. 排队调度 + 执行插件
         concurrency = plugin.get("concurrency", "parallel")
