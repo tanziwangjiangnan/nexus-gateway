@@ -1,3 +1,62 @@
+# Hermes Gateway
+
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Tests](https://img.shields.io/badge/tests-84%20passing-brightgreen.svg)]()
+
+**Hermes Gateway** 是一个模块化 AI 模型池网关，支持多 provider 路由、限流、熔断、Fiber 任务追踪和 undo 撤销栈。  
+从单体 `gateway.py`（2633 行）拆分为 **6 个独立可发布包**，每个包有独立版本、pyproject.toml 和单元测试。
+
+---
+
+## 架构
+
+```
+                     ┌─────────────┐
+                     │  gateway.py │  (448 行薄分发器)
+                     └──────┬──────┘
+                            │
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+      ┌────────────┐ ┌────────────┐ ┌────────────┐
+      │ hermes_api │ │ hermes_ops │ │ hermes_cfg │
+      │  (API 层)  │ │  (CLI 层)  │ │ (配置管理) │
+      └──────┬─────┘ └──────┬─────┘ └──────┬─────┘
+             │              │              │
+             ▼              ▼              ▼
+      ┌────────────┐ ┌────────────┐ ┌──────────────┐
+      │ hermes_fiber│ │ provider_ │ │ fiber_tree   │
+      │ (运行时)    │ │ router    │ │ (持久化存储) │
+      └────────────┘ └────────────┘ └──────────────┘
+```
+
+| 包 | PyPI 名 | 版本 | 依赖 |
+|---|---------|------|------|
+| `provider_router/` | `ops-provider-router` | 2.9.0 | — |
+| `fiber_tree/` | `ops-fiber-tree` | 2.9.0 | — |
+| `hermes_fiber/` | `ops-fiber` | 3.1.0 | — |
+| `hermes_cfg/` | `ops-cfg` | 3.0.0 | `ops-provider-router`, PyYAML |
+| `hermes_api/` | `ops-api` | 3.2.0 | `ops-provider-router`, `ops-cfg`, `ops-fiber`, FastAPI, uvicorn |
+| `hermes_ops/` | `ops-ops` | 3.3.0 | `ops-cfg`, PyYAML |
+
+## 快速开始
+
+```bash
+# 克隆 → 安装 → 启动
+git clone https://github.com/your-username/hermes-gateway.git
+cd hermes-gateway
+pip install -e ./provider_router -e ./fiber_tree -e ./hermes_fiber -e ./hermes_cfg -e ./hermes_ops -e ./hermes_api
+cp gateway.yaml.example gateway.yaml   # 编辑填入真实密钥
+python gateway.py                      # 启动服务
+```
+
+```bash
+# 运行测试
+python3 -m pytest tests/ -v
+```
+
+---
+
 # 模型池统一网关 v2
 
 三资源池路由引擎，OpenAI 兼容接口，独立基础设施，所有智能体平等消费。
@@ -420,7 +479,7 @@ python3 gateway.py feedback-stats   # 查看用户反馈统计
 
 ## 设计文档
 
-`/opt/workspace/ops/轻量化三资源池管理智能体-设计方案.md` — 含架构决策、替代方案评估、演进历史。
+`轻量化三资源池管理智能体-设计方案.md` — 含架构决策、替代方案评估、演进历史。
 
 ## 版本记录
 
@@ -443,3 +502,17 @@ python3 gateway.py feedback-stats   # 查看用户反馈统计
 | v2.8 | 跨分支全局去重（Root 级 `_global_call_history` + 三层清理）+ 插件排队（serial/throttle 并发控制） | 2026-08-25 |
 | v2.9 | 模型状态扩展：`/v1/models` 返回 `status`/`capabilities`/`error_rate`，熔断状态实时同步 | 2026-08-25 |
 | v2.10 | 质量反馈闭环：检查者评分 + 用户反馈驱动 Provider 权重自动调整 | 2026-08-26 |
+
+---
+
+## 许可证
+
+[MIT License](LICENSE) — 详见 [LICENSE](LICENSE) 文件。
+
+## 贡献指南
+
+欢迎贡献！请先阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。提交 PR 前请确保 `python3 -m pytest tests/ -v` 全部通过。
+
+## 安全漏洞
+
+发现安全漏洞请通过 [SECURITY.md](SECURITY.md) 描述的方式报告，请勿公开披露。
