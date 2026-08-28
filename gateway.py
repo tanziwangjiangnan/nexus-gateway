@@ -67,6 +67,7 @@ from provider_router import Router, RouterState, CircuitBreakerMonitor
 from fiber_tree import FiberTree, MemoryStorage
 from hermes_cfg import ConfigLoader, get_db, init_registry
 from hermes_fiber import FiberRuntime
+from hermes_ops.check_deps import check_deps_on_diff
 
 # ── 路径 ──
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -122,6 +123,7 @@ def reload_config():
     global _config, _disabled_providers
     new_cfg = _config_loader.reload()
     if _config:
+        check_deps_on_diff(_config, new_cfg, BASE, label="配置热加载")
         _config.clear()
         _config.update(new_cfg)
     else:
