@@ -43,6 +43,248 @@ def _get_provider_from_last_usage():
     return row["provider"] if row else None
 
 
+# ── 监督者（Supervisor）评分机制 ──
+# 默认开启但不每次都审：冷启动 100% → 稳态概率衰减 → 大变量强制复审
+# 完整设计文档见 .openhands/memory/designs/supervisor-scoring.md
+
+# 配置段读取（向后兼容 quality_feedback.* → supervisor.*）
+def _supervisor_cfg(cfg, key, default=None):
+    """从 supervisor 或 quality_feedback 段读取配置，新段优先。"""
+    v = cfg.get("supervisor", {}).get(key)
+    if v is not None:
+        return v
+    # 兼容旧配置路径
+    legacy_map = {
+        "enabled": ("quality_feedback", "runner_up_scoring"),
+        "cold_start_count": ("quality_feedback", "scoring_warmup"),
+        "force_on.timeout": ("quality_feedback", "scoring_max_interval"),
+    }
+    if key in legacy_map:
+        sec, old_key = legacy_map[key]
+        v = cfg.get(sec, {}).get(old_key)
+        if v is not None:
+            return v
+    return default
+
+
+def _read_force_on(cfg):
+    """读取 force_on 列表，返回 set 或默认值。"""
+    raw = cfg.get("supervisor", {}).get("force_on")
+    if isinstance(raw, list):
+        items = set()
+        for item in raw:
+            if isinstance(item, dict):
+                items.update(item.keys())
+            elif isinstance(item, str):
+                items.add(item)
+        return items
+    return {"timeout", "runner_changed"}
+
+
+def _should_score(cfg, provider, runner_up, scoring_state, now=None):
+    """判断是否应该对这次请求启动评分。
+
+    三层触发：
+    1. 冷启动期 count < cold_start_count → 100%
+    2. 稳态期 p = max(min_sample_rate, 1/sqrt(count))
+    3. 强制复审（跳过概率）：
+       - 超时：now - last > force_on.timeout
+       - 裁判变化：runner_up 不在 last_runners 中
+       - 方差突变：连续 3 次评分标准差 > 15
+       - 新鲜度窗口：5 分钟内已评且无变化，跳过强制复审
+    """
+    if not runner_up:
+        return False, "no_runner_up"
+    # 显式关闭则不触发（默认开启）
+    if not _supervisor_cfg(cfg, "enabled", True):
+        return False, "disabled_by_config"
+    now = now or time.time()
+    st = scoring_state.get(provider, {})
+    count = st.get("count", 0)
+    last = st.get("last", 0)
+
+    # ── 大变量检查：从未评分 ──
+    if count == 0:
+        return True, "cold_start"
+
+    # 读取配置
+    force_on = _read_force_on(cfg)
+    max_interval = _supervisor_cfg(cfg, "force_on.timeout", 3600)
+    cold_start = _supervisor_cfg(cfg, "cold_start_count", 10)
+    min_rate = _supervisor_cfg(cfg, "min_sample_rate", 0.05)
+
+    # ── 新鲜度窗口：5 分钟内已评且无变量变化，跳过强制复审 ──
+    freshness_window = _supervisor_cfg(cfg, "freshness_window", 300)
+    if last and (now - last) < freshness_window:
+        # 裁判没变 → 跳过
+        if "runner_changed" in force_on and runner_up["name"] in st.get("last_runners", []):
+            return False, "freshness_skip"
+        return False, "freshness_skip"
+
+    # ── 强制复审 1：超时 ──
+    if "timeout" in force_on and last and (now - last) > max_interval:
+        return True, "stale"
+
+    # ── 强制复审 2：裁判变化 ──
+    if "runner_changed" in force_on:
+        last_runners = st.get("last_runners", [])
+        if last_runners and runner_up["name"] not in last_runners:
+            return True, "new_judge"
+
+    # ── 强制复审 3：方差突变 ──
+    recent_scores = st.get("recent_scores", [])
+    variance_boost = st.get("variance_boost_remaining", 0)
+    if variance_boost > 0:
+        # 方差爆发期：采样率提升到 50%
+        if random.random() < 0.5:
+            return True, "variance_boost"
+    elif len(recent_scores) >= 3:
+        # 算标准差
+        mean = sum(recent_scores) / len(recent_scores)
+        variance = sum((s - mean) ** 2 for s in recent_scores) / len(recent_scores)
+        stddev = variance ** 0.5
+        if stddev > 15:
+            return True, "variance_spike"
+
+    # ── 冷启动期 ──
+    if count < cold_start:
+        return True, "warmup"
+
+    # ── 稳态：概率采样 ──
+    p = max(min_rate, 1.0 / (count ** 0.5))
+    if random.random() < p:
+        return True, f"sample_p={p:.2f}"
+    return False, f"skip_p={p:.2f}"
+
+
+async def _score_by_runner_up(cfg, provider, runner_up,
+                               provider_model, messages, resp_body,
+                               quality_factors, scoring_state):
+    """后台任务：调第二名给第一名的回答打分。"""
+    try:
+        # 构造评分 prompt
+        data = json.loads(resp_body)
+        assistant_reply = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not assistant_reply:
+            return
+
+        scoring_cfg = cfg.get("supervisor", {}).get("scoring", {})
+        scoring_prompt = scoring_cfg.get("prompt") or (
+            "你是一个质量评分员。请根据用户的提问和 AI 的回答，"
+            "给回答的质量评分（0-100，整数）。"
+            "考虑：准确性、完整性、逻辑性、语言质量。"
+            "只返回数字，不要其他文字。"
+        )
+        scoring_messages = [
+            {"role": "system", "content": scoring_prompt},
+            {
+                "role": "user",
+                "content": f"问题：{messages[-1]['content'] if messages else ''}\n\n回答：{assistant_reply[:2000]}"
+            },
+        ]
+
+        # 确定评分模型
+        scoring_model = scoring_cfg.get("model")
+        # 找 runner-up 的 API 配置
+        rp_cfg = cfg.get("providers", {}).get(runner_up["name"])
+        if not rp_cfg:
+            return
+        rp_key = Router.resolve_env_key(rp_cfg.get("api_key", ""))
+        if not rp_key:
+            return
+        rp_api = rp_cfg["api"].rstrip("/")
+        # 如果配置了评分模型，用评分模型；否则用 runner_up 的第一个模型
+        if scoring_model:
+            scoring_model_used = scoring_model
+        else:
+            scoring_model_used = runner_up.get("models", [provider_model])[0]
+
+        # 发起评分请求
+        async with httpx.AsyncClient(timeout=30) as client:
+            score_resp = await client.post(
+                f"{rp_api}/chat/completions",
+                json={
+                    "model": scoring_model_used,
+                    "messages": scoring_messages,
+                    "max_tokens": 50,
+                    "temperature": 0,
+                },
+                headers={"Authorization": f"Bearer {rp_key}"},
+            )
+            if score_resp.status_code != 200:
+                return
+            score_data = score_resp.json()
+            score_text = (score_data.get("choices", [{}])[0]
+                          .get("message", {}).get("content", ""))
+            # 解析数字
+            score = None
+            for token in score_text.strip().split():
+                try:
+                    s = int(''.join(c for c in token if c.isdigit() or c == '-'))
+                    if 0 <= s <= 100:
+                        score = s
+                        break
+                except ValueError:
+                    continue
+            if score is None:
+                return
+            # 写入 DB
+            conn = get_db()
+            conn.execute(
+                "UPDATE usage SET checker_score = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY id DESC LIMIT 1)",
+                (score, provider))
+            conn.commit()
+            conn.close()
+            # 更新运行时质量因子
+            quality_window = cfg.get("quality_feedback", {}).get("quality_window", 20)
+            conn2 = get_db()
+            rows = conn2.execute(
+                "SELECT checker_score FROM usage WHERE provider = ? AND checker_score IS NOT NULL ORDER BY id DESC LIMIT ?",
+                (provider, quality_window)
+            ).fetchall()
+            conn2.close()
+            if rows:
+                avg = sum(r[0] for r in rows) / len(rows)
+                quality_factors[provider] = max(0.5, min(1.0, avg / 100.0))
+            # 更新评分状态
+            if provider not in scoring_state:
+                scoring_state[provider] = {}
+            st = scoring_state[provider]
+            now = time.time()
+            st["last"] = now
+            st["count"] = st.get("count", 0) + 1
+            st["last_score_value"] = score
+            # 更新 last_runners（最多保留 3 个）
+            last_runners = st.get("last_runners", [])
+            if runner_up["name"] not in last_runners:
+                last_runners.append(runner_up["name"])
+                if len(last_runners) > 3:
+                    last_runners.pop(0)
+            st["last_runners"] = last_runners
+            # 更新 recent_scores（最多 5 个，用于方差检测）
+            recent = st.get("recent_scores", [])
+            recent.append(score)
+            if len(recent) > 5:
+                recent.pop(0)
+            st["recent_scores"] = recent
+            # 方差爆发期递减
+            if st.get("variance_boost_remaining", 0) > 0:
+                st["variance_boost_remaining"] -= 1
+            # 如果这次评分确实触发了方差突变，设置爆发期
+            stddev = 0.0
+            if len(recent) >= 3:
+                mean = sum(recent) / len(recent)
+                variance = sum((s - mean) ** 2 for s in recent) / len(recent)
+                stddev = variance ** 0.5
+                if stddev > 15:
+                    st["variance_boost_remaining"] = 5
+            print(f"📋 监督者评分 [{runner_up['name']}]→{provider}: {score}分 "
+                  f"(第{st['count']}次, 标准差={stddev:.1f})")
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
 def build_app(cfg, deps):
     """构建 FastAPI 应用实例。
 
@@ -76,7 +318,10 @@ def build_app(cfg, deps):
     find_model_config = deps["find_model_config"]
     select_pool_by_keywords = deps["select_pool_by_keywords"]
     select_provider_by_weight = deps["select_provider_by_weight"]
+    select_provider_with_runner_up = deps["select_provider_with_runner_up"]
     check_rate_limit = deps["check_rate_limit"]
+    _quality_factors = deps["quality_factors"]
+    _user_factors = deps["user_factors"]
     _log_matches = deps["log_matches"]
     _parse_log_line = deps["parse_log_line"]
 
@@ -361,20 +606,22 @@ def build_app(cfg, deps):
             if not pool_cfg:
                 break
 
-            # 4. 按权重选 provider
+            # 4. 按权重选 provider（同时选出第二名作为潜在检查者）
             # 用户自定义 key 时不限制模型名（用户用自己的 key 调任何 provider），
             # 否则只选有该模型的 provider
             model_filter = None if user_key else model
-            pv = select_provider_by_weight(pool_cfg.get("providers", []), model=model_filter)
+            pv, runner_up, _ = select_provider_with_runner_up(
+                pool_cfg.get("providers", []), model=model_filter)
             if not pv:
                 last_error = f"pool '{current_pool}' all providers disabled"
                 current_pool = pool_cfg.get("fallback")
                 continue
 
             provider_cfg = cfg.get("providers", {}).get(pv["name"])
-            # 有效 key：用户自定义 key 优先，否则用 provider 配置的 key
-            effective_key = user_key or provider_cfg.get("api_key", "") if provider_cfg else user_key
-            if not provider_cfg or not effective_key or (not user_key and provider_cfg.get("api_key", "").startswith("${")):
+            # 有效 key：用户自定义 key 优先，否则用 provider 配置的 key（支持 ${ENV} 引用）
+            configured_key = Router.resolve_env_key(provider_cfg.get("api_key", "")) if provider_cfg else ""
+            effective_key = user_key or configured_key
+            if not provider_cfg or not effective_key:
                 last_error = f"provider '{pv['name']}' key not resolved"
                 current_pool = pool_cfg.get("fallback")
                 continue
@@ -439,6 +686,20 @@ def build_app(cfg, deps):
 
                     app.state.req_counter.labels(pool=current_pool, provider=pv["name"], status="200").inc()
                     app.state.req_duration.labels(provider=pv["name"]).observe(time.time() - t0)
+                    # 第二名检查者：自适应采样频率
+                    # 默认开启，冷启动每次都审 → 稳态概率衰减 → 大变量强制复审
+                    if runner_up and not user_key:
+                        decision, reason = _should_score(cfg, pv["name"], runner_up, _scoring_state)
+                        if decision:
+                            asyncio.get_event_loop().create_task(
+                                _score_by_runner_up(
+                                    cfg=cfg, provider=pv["name"], runner_up=runner_up,
+                                    provider_model=provider_model,
+                                    messages=messages, resp_body=resp_body,
+                                    quality_factors=_quality_factors,
+                                    scoring_state=_scoring_state,
+                                )
+                            )
                     return Response(content=resp_body, status_code=status_code, media_type="application/json")
 
             except httpx.TimeoutException:
@@ -488,7 +749,8 @@ def build_app(cfg, deps):
                 raise HTTPException(status_code=400, detail=f"model '{model}' not found in any provider")
 
         provider_cfg = cfg.get("providers", {}).get(direct_provider_name)
-        if not provider_cfg or not provider_cfg.get("api_key", "") or provider_cfg["api_key"].startswith("${"):
+        direct_key = Router.resolve_env_key(provider_cfg.get("api_key", "")) if provider_cfg else ""
+        if not provider_cfg or not direct_key:
             raise HTTPException(status_code=400, detail=f"provider '{direct_provider_name}' not configured or key not resolved")
         api = provider_cfg["api"].rstrip("/")
 
@@ -497,7 +759,7 @@ def build_app(cfg, deps):
             resp = await client.post(
                 f"{api}/chat/completions",
                 json=req_body,
-                headers={"Authorization": f"Bearer {provider_cfg['api_key']}"},
+                headers={"Authorization": f"Bearer {direct_key}"},
             )
 
         if stream:
@@ -1371,6 +1633,12 @@ def build_app(cfg, deps):
             "validation_fiber_id": validation_fid,
             "cached": cached,
         }
+
+    # ── 第二名检查者（Runner-up Scoring）──
+    # 自适应采样频率：冷启动每次都审 → 稳态概率衰减 → 大变量强制复审
+    # 默认开启，无需配置
+
+    _scoring_state = {}  # {provider: {"count", "last", "last_runners", "recent_scores", "variance_boost_remaining"}}
 
     return app
 

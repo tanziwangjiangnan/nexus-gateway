@@ -60,15 +60,17 @@ def scan_local(index, config, base):
     oh_paths = [
         os.path.expanduser("~/.openhands/config.toml"),
         os.path.expanduser("~/.config/oh/config.toml"),
+        os.path.expanduser("~/.hermes/config.yaml"),
+        os.path.expanduser("~/.hermes/.env"),
     ]
     for oh_path in oh_paths:
         if os.path.isfile(oh_path):
             with open(oh_path) as f:
                 content = f.read()
                 for key_name, key_val in config.items():
-                    if key_val in content:
+                    if key_val and key_val in content:
                         index.append({
-                            "component": "OpenHands",
+                            "component": os.path.basename(os.path.dirname(oh_path)) + "/" + os.path.basename(oh_path),
                             "file": oh_path,
                             "key_name": key_name,
                             "current_value": key_val,
@@ -127,6 +129,88 @@ def scan_remote(host, port, cmd, config, label):
                  "fixable": False, "fix_type": "unreachable"}]
 
 
+def find_references(keys, base, include_remote=True):
+    """扫描指定配置值的下游引用。
+
+    keys: {key_name: key_value} — 只扫描这些值的引用（通常是即将被替换的旧值）。
+    返回 [{component, file, key_name, current_value, found_at, fixable, fix_type}]
+    """
+    index = []
+    scan_local(index, keys, base)
+    if include_remote:
+        index += scan_remote("106.14.40.189", "2222",
+                             "cat /opt/qq-bot/bot/astrbot/data/cmd_config.json",
+                             keys, "AstrBot（老机）")
+        index += scan_remote("106.14.20.149", "2222",
+                             "cat /opt/kb-agent/config.json 2>/dev/null || cat /app/config.json 2>/dev/null || echo 'NO_CONFIG'",
+                             keys, "kb_agent（新机）")
+    return index
+
+
+def diff_config_keys(old_cfg, new_cfg):
+    """对比新旧配置，找出变化的敏感值（api / api_key / gateway_key）。
+
+    返回 {key_name: 旧值} — 旧值即"将被替换、可能还有下游引用"的值。
+    """
+    changed = {}
+
+    def _prov(cfg):
+        return cfg.get("providers", {}) if cfg else {}
+
+    for name in set(_prov(old_cfg)) | set(_prov(new_cfg)):
+        o = _prov(old_cfg).get(name, {})
+        n = _prov(new_cfg).get(name, {})
+        for field in ("api", "api_key"):
+            ov, nv = o.get(field), n.get(field)
+            if ov != nv and ov:
+                changed[f"providers.{name}.{field}"] = ov
+
+    if old_cfg and new_cfg and old_cfg.get("gateway_key") != new_cfg.get("gateway_key"):
+        changed["gateway_key"] = old_cfg.get("gateway_key")
+    return changed
+
+
+def check_deps_on_diff(old_cfg, new_cfg, base, label="变更"):
+    """对比新旧配置，找出变化的敏感值，扫描下游引用并打印。"""
+    changed = diff_config_keys(old_cfg, new_cfg)
+    if not changed:
+        return True  # 无敏感变更，安全
+
+    print(f"\n🔄 {label} 检测到以下配置变更：\n")
+    for kn, kv in changed.items():
+        print(f"   📌 {kn}: {kv[:60]}...")
+    print()
+
+    refs = find_references(changed, base)
+    if not refs:
+        print("✅ 未发现下游引用，变更安全。")
+        return True
+
+    fixable = [d for d in refs if d.get("fixable")]
+    unfixable = [d for d in refs if not d.get("fixable")]
+
+    if unfixable:
+        print("⚠️   以下下游引用无法自动修复，变更可能影响：\n")
+        for d in unfixable:
+            print(f"   ❌ {d['component']}")
+            print(f"      {d['found_at']}")
+        print()
+
+    if fixable:
+        print(f"🔧 以下 {len(fixable)} 个下游引用可自动同步：\n")
+        for d in fixable:
+            print(f"   📎 {d['component']} ({d['file']})")
+            print(f"      {d['found_at']}")
+        print()
+
+    print("⚠️   建议：")
+    print("     1. 确认下游系统已适配新配置")
+    if fixable:
+        print("     2. 执行 `check-deps --auto-sync` 自动同步下游引用")
+    print()
+    return False
+
+
 def cmd_check_deps(config, base, target_key=None, auto_sync=False):
     """check-deps 命令：反向依赖扫描 + 可选自动同步。"""
     all_keys = collect_all_keys(config)
@@ -147,14 +231,7 @@ def cmd_check_deps(config, base, target_key=None, auto_sync=False):
         print(f"  📌 {kn}: {kv[:60]}...")
     print()
 
-    index = []
-    scan_local(index, all_keys, base)
-    index += scan_remote("106.14.40.189", "2222",
-                         "cat /opt/qq-bot/bot/astrbot/data/cmd_config.json",
-                         all_keys, "AstrBot（老机）")
-    index += scan_remote("106.14.20.149", "2222",
-                         "cat /opt/kb-agent/config.json 2>/dev/null || cat /app/config.json 2>/dev/null || echo 'NO_CONFIG'",
-                         all_keys, "kb_agent（新机）")
+    index = find_references(all_keys, base)
 
     if not index:
         print("✅ 未发现任何外部依赖，配置变更安全。")

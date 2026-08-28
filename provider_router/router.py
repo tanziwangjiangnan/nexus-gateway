@@ -57,35 +57,93 @@ class Router:
         默认权重 = 动态权重 × 质量因子 × 用户因子，保底 0.1。
         返回 provider 配置 dict 或 None。
         """
+        picked, _ = Router._select_weighted(providers, state, model, weight_fn)
+        return picked
+
+    @staticmethod
+    def select_provider_with_runner_up(providers: list, state: RouterState,
+                                        model: str = None, weight_fn: Callable = None):
+        """按权重选一个 provider，同时返回第二名（候选池中权重次高者）。
+
+        第二名作为"检查者"：主请求完成后，第二名会收到主请求的问题+回答，
+        并打一个质量分（0-100）。返回 (selected, runner_up, all_weights)。
+
+        若候选不足 2 个，runner_up 为 None。
+        """
         candidates = [p for p in providers if p["name"] not in state.disabled_providers]
         if model:
             model_lower = model.lower()
             candidates = [p for p in candidates
                           if model_lower in [m.lower() for m in p.get("models", [])]]
         if not candidates:
-            return None
-        total = 0
+            return None, None, {}
+        # 计算所有候选的权重
         weights = []
         for p in candidates:
             if weight_fn:
                 w = weight_fn(p, state)
             else:
-                # 默认权重：动态权重优先，无则用 YAML 静态权重
                 w = state.dynamic_weights.get(p["name"]) or p.get("weight", 1)
-                # 质量信誉因子 × 用户信誉因子
                 qf = state.quality_factors.get(p["name"], 1.0)
                 uf = state.user_factors.get(p["name"], 1.0)
                 w = w * qf * uf
-                w = max(w, 0.1)  # 保底
+                w = max(w, 0.1)
             weights.append(w)
-            total += w
+        # 轮盘赌选第一名
+        total = sum(weights)
+        r = random.uniform(0, total)
+        upto = 0
+        picked_idx = 0
+        for i, p in enumerate(candidates):
+            upto += weights[i]
+            if r <= upto:
+                picked_idx = i
+                break
+        picked = candidates[picked_idx]
+        # 从剩余中再按权重选第二名
+        remaining = [candidates[i] for i in range(len(candidates)) if i != picked_idx]
+        remaining_w = [weights[i] for i in range(len(weights)) if i != picked_idx]
+        runner_up = None
+        if remaining:
+            r2 = random.uniform(0, sum(remaining_w))
+            upto2 = 0
+            for i, p in enumerate(remaining):
+                upto2 += remaining_w[i]
+                if r2 <= upto2:
+                    runner_up = p
+                    break
+        all_weights = {p["name"]: w for p, w in zip(candidates, weights)}
+        return picked, runner_up, all_weights
+
+    @staticmethod
+    def _select_weighted(providers, state, model=None, weight_fn=None):
+        """内部：轮盘赌选一个，返回 (provider, weights_list)。"""
+        candidates = [p for p in providers if p["name"] not in state.disabled_providers]
+        if model:
+            model_lower = model.lower()
+            candidates = [p for p in candidates
+                          if model_lower in [m.lower() for m in p.get("models", [])]]
+        if not candidates:
+            return None, []
+        weights = []
+        for p in candidates:
+            if weight_fn:
+                w = weight_fn(p, state)
+            else:
+                w = state.dynamic_weights.get(p["name"]) or p.get("weight", 1)
+                qf = state.quality_factors.get(p["name"], 1.0)
+                uf = state.user_factors.get(p["name"], 1.0)
+                w = w * qf * uf
+                w = max(w, 0.1)
+            weights.append(w)
+        total = sum(weights)
         r = random.uniform(0, total)
         upto = 0
         for i, p in enumerate(candidates):
             upto += weights[i]
             if r <= upto:
-                return p
-        return candidates[-1]
+                return p, weights
+        return candidates[-1], weights
 
     @staticmethod
     def check_rate_limit(provider_name: str, max_rps: int, state: RouterState):

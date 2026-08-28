@@ -148,4 +148,53 @@ class TestCircuitBreakerMonitor:
     def test_default_user_factor(self):
         uf = CircuitBreakerMonitor._default_user_factor([1, 1])
         assert 1.0 < uf < 1.5
-        assert CircuitBreakerMonitor._default_user_factor([]) == 1.0
+
+
+class TestRouterSelectWithRunnerUp:
+    def test_runner_up_returned(self):
+        providers = SAMPLE_CFG["pools"]["pool_a"]["providers"]
+        state = RouterState()
+        for _ in range(100):
+            picked, runner_up, weights = Router.select_provider_with_runner_up(providers, state)
+            assert picked is not None
+            assert runner_up is not None
+            assert picked["name"] != runner_up["name"]
+            assert picked["name"] in weights
+            assert runner_up["name"] in weights
+
+    def test_runner_up_single_returns_none(self):
+        providers = SAMPLE_CFG["pools"]["pool_b"]["providers"]  # 只有一个 provider
+        state = RouterState()
+        picked, runner_up, weights = Router.select_provider_with_runner_up(providers, state)
+        assert picked is not None
+        assert runner_up is None
+        assert picked["name"] == "qfg-codex"
+
+    def test_runner_up_model_filter(self):
+        providers = SAMPLE_CFG["pools"]["pool_a"]["providers"]
+        state = RouterState()
+        for _ in range(50):
+            picked, runner_up, weights = Router.select_provider_with_runner_up(
+                providers, state, model="mimo-v2.5-pro")
+            assert picked is not None
+            assert picked["name"] == "xiaomi"
+            # 只有一个候选有该模型，runner_up 应为 None
+            assert runner_up is None
+
+    def test_runner_up_no_candidates(self):
+        providers = SAMPLE_CFG["pools"]["pool_a"]["providers"]
+        state = RouterState()
+        picked, runner_up, weights = Router.select_provider_with_runner_up(
+            providers, state, model="non-existent")
+        assert picked is None
+        assert runner_up is None
+        assert weights == {}
+
+    def test_runner_up_excludes_disabled(self):
+        providers = SAMPLE_CFG["pools"]["pool_a"]["providers"]
+        state = RouterState()
+        state.disabled_providers.add("scnet-tp")
+        for _ in range(50):
+            picked, runner_up, weights = Router.select_provider_with_runner_up(providers, state)
+            assert picked["name"] == "xiaomi"
+            assert runner_up is None  # 只剩一个

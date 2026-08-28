@@ -1,8 +1,13 @@
 """测试 hermes_ops 包：CLI 命令"""
-import pytest, io, contextlib
+import pytest, io, contextlib, tempfile, os
 from hermes_ops import cmd_models, cmd_usage, cmd_quality, cmd_feedback_stats, cmd_check_deps, cmd_scan_agents
 from hermes_ops.check_deps import collect_all_keys, scan_local
 from hermes_cfg import get_db
+
+# 使用临时文件作为共享 DB，避免 :memory: 连接隔离问题
+_TMP_DB = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+_TMP_DB.close()
+_TMP_DB_PATH = _TMP_DB.name
 
 SAMPLE_CFG = {
     "port": 8646,
@@ -22,14 +27,27 @@ SAMPLE_CFG = {
     },
     "agents": [],
     "plugins": {},
-    "config": {"db_path": ":memory:", "db_type": "sqlite"},
+    "config": {"db_path": _TMP_DB_PATH, "db_type": "sqlite"},
 }
+
+
+def _cleanup():
+    try:
+        os.unlink(_TMP_DB_PATH)
+    except OSError:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def cleanup_db():
+    yield
+    _cleanup()
 
 
 class TestCmdModels:
     def test_cmd_models_output(self):
         # 注册模型到 registry 表，让 cmd_models 有数据可显示
-        conn = get_db()
+        conn = get_db(_TMP_DB_PATH)
         conn.execute("INSERT OR IGNORE INTO registry (model, pool, provider, tier, status, notes) VALUES (?,?,?,?,?,?)",
                      ("test-model", "pool_a", "test-pv", "1", "unknown", ""))
         conn.commit()

@@ -470,6 +470,23 @@ quality_feedback:
   quality_min_samples: 5    # 低于此样本数时，不使用质量因子
   user_window: 20           # 取最近 N 次用户反馈
   update_interval: 30       # 后台更新间隔（秒）
+  runner_up_scoring: true   # 第二名检查者评分（默认开启）
+  # 新配置段 supervisor.* 优先于 quality_feedback.*
+  scoring_warmup: 10        # 冷启动采样阈值：低于此值每次都审
+  scoring_max_interval: 3600 # 距上次评分超过此秒数时强制复审
+
+# 监督者（Supervisor）评分 — 新配置段，优先级高于 quality_feedback
+supervisor:
+  enabled: true              # 默认开启
+  cold_start_count: 10        # 冷启动阈值：低于此值每次都审
+  min_sample_rate: 0.05       # 稳态最低采样率
+  freshness_window: 300       # 新鲜度窗口（秒）：窗口内跳过
+  force_on:
+    - timeout: 3600           # 超时强制复审（秒）
+    - runner_changed          # 第二名换人时强制复审
+  scoring:
+    model: ""                 # 评分模型（可选，默认用 runner_up 自身）
+    prompt: ""                # 评分 prompt（可选，有默认值）
 ```
 
 ### CLI 命令

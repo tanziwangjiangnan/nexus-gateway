@@ -15,7 +15,7 @@ from hermes_cfg import get_db
 
 
 def cmd_models(cfg):
-    conn = get_db()
+    conn = get_db(cfg.get("config", {}).get("db_path"))
     rows = conn.execute("""SELECT r.model, r.pool, r.provider, r.tier, r.status,
                                   COALESCE(SUM(u.prompt_tokens+u.completion_tokens), 0) as tokens
                            FROM registry r LEFT JOIN usage u ON u.model=r.model
@@ -29,7 +29,7 @@ def cmd_models(cfg):
 
 
 def cmd_usage(cfg):
-    conn = get_db()
+    conn = get_db(cfg.get("config", {}).get("db_path"))
     today = datetime.date.today().isoformat()
     rows = conn.execute("""SELECT model, pool, provider, SUM(prompt_tokens) as p, SUM(completion_tokens) as c,
                                   COUNT(*) as n, SUM(ok) as ok, SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) as fail
@@ -52,7 +52,7 @@ def cmd_usage(cfg):
 
 def cmd_quality(cfg):
     """查看每个 Provider 的质量排名（基于检查者评分）。"""
-    conn = get_db()
+    conn = get_db(cfg.get("config", {}).get("db_path"))
     rows = conn.execute("""
         SELECT provider, COUNT(*) as n, ROUND(AVG(checker_score), 1) as avg_score
         FROM usage WHERE checker_score IS NOT NULL
@@ -72,7 +72,7 @@ def cmd_quality(cfg):
 
 def cmd_feedback_stats(cfg):
     """查看每个 Provider 的用户反馈统计。"""
-    conn = get_db()
+    conn = get_db(cfg.get("config", {}).get("db_path"))
     rows = conn.execute("""
         SELECT provider,
                COUNT(*) as n,
