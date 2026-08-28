@@ -26,6 +26,7 @@
 - v3.2: 拆分 `hermes_api/` HTTP API 层（build_app 函数 + 依赖注入）
 - v3.3: 拆分 `hermes_ops/` 操作层（CLI 命令 + 健康探测 + 反向依赖检查 + 智能体发现，gateway.py 仅剩 448 行）
 - v3.4: 包版本化 — 6 个包各加 `pyproject.toml`，PyPI 统一使用 `ops-` 前缀（用户指定）
+- v3.5: 测试粒度 — 6 个包各建单元测试 `tests/`，84/84 通过
 
 ## 组件导出接口
 
