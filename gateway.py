@@ -305,6 +305,10 @@ def select_provider_by_weight(providers, model=None):
     """按权重随机选一个 provider，跳过禁用的；若指定 model 则只选有该模型的（大小写不敏感）"""
     return Router.select_provider(providers, _router_state, model=model)
 
+def select_provider_with_runner_up(providers, model=None):
+    """按权重选 provider，同时返回第二名（检查者）。返回 (selected, runner_up, weights)"""
+    return Router.select_provider_with_runner_up(providers, _router_state, model=model)
+
 def check_rate_limit(provider_name, max_rps):
     """滑动窗口限流，返回 True=通过 False=限流"""
     return Router.check_rate_limit(provider_name, max_rps, _router_state)
@@ -336,7 +340,10 @@ def create_app(cfg):
         "find_model_config": find_model_config,
         "select_pool_by_keywords": select_pool_by_keywords,
         "select_provider_by_weight": select_provider_by_weight,
+        "select_provider_with_runner_up": select_provider_with_runner_up,
         "check_rate_limit": check_rate_limit,
+        "quality_factors": _quality_factors,
+        "user_factors": _user_factors,
         "log_matches": _log_matches,
         "parse_log_line": _parse_log_line,
     }
