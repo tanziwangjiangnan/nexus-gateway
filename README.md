@@ -75,6 +75,7 @@ python3 gateway.py git-diff           # 未提交的配置变更
 | `POST /admin/mcp/toggle` | Agent 调用 toggle（走审批缓存 + fiber） |
 | `GET /admin/mcp/approvals` | 查看审批缓存 |
 | `GET /admin/mcp/status` | 熔断 + 权重 + 错误率总览 |
+| `POST /admin/feedback` | 提交用户反馈（点赞/点踩），实时调整 Provider 权重（v2.7） |
 | `POST /admin/fiber/create` | 创建 Agent 任务树节点 |
 | `POST /admin/fiber/{id}/fail` | 失败/级联回滚 |
 | `POST /admin/fiber/{id}/commit` | 提交/合并 undo |
@@ -387,6 +388,36 @@ SIGHUP 热加载：自动 git commit 快照 + 清空运行时状态 + 重启生�
 | 运行时层 | `_undo_stack`（人类操作） | `python3 gateway.py undo` |
 | 任务层 | `Fiber` 树（Agent 操作） | `POST /admin/fiber/{id}/fail` 级联回滚 |
 
+## 质量反馈闭环（v2.10）
+
+检查者验收时给执行者的输出打分（0-100），用户通过 `/admin/feedback` 提交点赞/点踩，后台线程每30秒汇总为质量信誉因子和用户信誉因子，叠加到动态权重公式中。
+
+```
+最终权重 = 静态权重 × (1 - 错误率) × 质量信誉因子 × 用户信誉因子
+```
+
+- 质量因子（检查者评分驱动）：0.5~1.0，取最近20次平均分，低样本默认1.0
+- 用户因子（用户反馈驱动）：0.5~1.5，每个点赞+0.1，每个点踩-0.1
+- `/admin/feedback` 实时生效，不等30秒循环
+
+### 配置段
+
+```yaml
+quality_feedback:
+  enabled: true
+  quality_window: 20        # 取最近 N 次检查者评分
+  quality_min_samples: 5    # 低于此样本数时，不使用质量因子
+  user_window: 20           # 取最近 N 次用户反馈
+  update_interval: 30       # 后台更新间隔（秒）
+```
+
+### CLI 命令
+
+```bash
+python3 gateway.py quality          # 查看质量排名
+python3 gateway.py feedback-stats   # 查看用户反馈统计
+```
+
 ## 设计文档
 
 `/opt/workspace/ops/轻量化三资源池管理智能体-设计方案.md` — 含架构决策、替代方案评估、演进历史。
@@ -411,3 +442,4 @@ SIGHUP 热加载：自动 git commit 快照 + 清空运行时状态 + 重启生�
 | v2.7 | 三池层级关系确认 + 重复调用拦截 + 工具调用级动态校验（Schema 校验 + 熔断联动） | 2026-08-25 |
 | v2.8 | 跨分支全局去重（Root 级 `_global_call_history` + 三层清理）+ 插件排队（serial/throttle 并发控制） | 2026-08-25 |
 | v2.9 | 模型状态扩展：`/v1/models` 返回 `status`/`capabilities`/`error_rate`，熔断状态实时同步 | 2026-08-25 |
+| v2.10 | 质量反馈闭环：检查者评分 + 用户反馈驱动 Provider 权重自动调整 | 2026-08-26 |

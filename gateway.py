@@ -54,7 +54,6 @@ import os
 import random
 import re
 import signal
-import sqlite3
 import subprocess
 import shlex
 import sys
@@ -65,8 +64,8 @@ import httpx
 
 # ── 组件包导入 ──
 from provider_router import Router, RouterState, CircuitBreakerMonitor
-from provider_router.config import load_config as pr_load_config
 from fiber_tree import FiberTree, MemoryStorage
+from hermes_cfg import ConfigLoader, get_db, init_registry
 
 # ── 路径 ──
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -106,10 +105,15 @@ _fiber_tree = FiberTree()
 _serial_locks = {}              # {resource_lock_key: asyncio.Lock} — 串行锁池
 _throttle_windows = {}          # {plugin_id: [t1, t2, ...]} — 速率限制窗口
 
-# ── 配置加载 ──
+# ── 配置加载（委托给 hermes_cfg） ──
+_config_loader = ConfigLoader(path=CONFIG_PATH)
+
 def load_config(path=None):
-    path = path or CONFIG_PATH
-    return pr_load_config(path)
+    if path:
+        # 指定路径时直接加载（不更新全局）
+        from provider_router.config import load_config as pr_load
+        return pr_load(path)
+    return _config_loader.load()
 
 def reload_config():
     """重载 YAML 配置，同步运行时状态，清空运行时逆栈。
@@ -122,7 +126,7 @@ def reload_config():
     4. _rate_limit_buckets 不清（滑动窗口，自动过期）
     """
     global _config, _disabled_providers
-    new_cfg = load_config()
+    new_cfg = _config_loader.reload()
     if _config:
         _config.clear()
         _config.update(new_cfg)
@@ -132,54 +136,8 @@ def reload_config():
     undo_clear("配置重载")
     return _config
 
-# ── 数据库 ──
-def get_db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("""CREATE TABLE IF NOT EXISTS registry (
-        model TEXT PRIMARY KEY, pool TEXT, provider TEXT NOT NULL,
-        tier TEXT DEFAULT 'B', status TEXT DEFAULT 'unknown',
-        notes TEXT DEFAULT '', created_at TEXT DEFAULT (datetime('now')),
-        updated_at TEXT DEFAULT (datetime('now'))
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS usage (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, model TEXT NOT NULL,
-        pool TEXT, provider TEXT, prompt_tokens INTEGER DEFAULT 0,
-        completion_tokens INTEGER DEFAULT 0, ok INTEGER DEFAULT 1,
-        checker_score REAL DEFAULT NULL,
-        user_feedback INTEGER DEFAULT 0,
-        called_at TEXT DEFAULT (datetime('now'))
-    )""")
-    # v2.7 迁移：安全追加列（若缺失）
-    for col, col_type in [("checker_score", "REAL DEFAULT NULL"),
-                          ("user_feedback", "INTEGER DEFAULT 0")]:
-        try:
-            conn.execute(f"ALTER TABLE usage ADD COLUMN {col} {col_type}")
-        except sqlite3.OperationalError:
-            pass  # 列已存在
-    conn.execute("""CREATE TABLE IF NOT EXISTS health_log (
-        model TEXT NOT NULL, pool TEXT, provider TEXT,
-        ok INTEGER NOT NULL, latency_ms INTEGER DEFAULT 0,
-        error TEXT DEFAULT '', checked_at TEXT DEFAULT (datetime('now'))
-    )""")
-    conn.commit()
-    return conn
-
-def init_registry(cfg):
-    conn = get_db()
-    for pool_name, pool_cfg in cfg.get("pools", {}).items():
-        for pv in pool_cfg.get("providers", []):
-            provider_name = pv["name"]
-            for model in pv.get("models", []):
-                conn.execute("""INSERT OR IGNORE INTO registry
-                    (model, pool, provider, tier, status, notes)
-                    VALUES (?, ?, ?, ?, 'unknown', ?)""",
-                    (model, pool_name, provider_name,
-                     "A" if pool_name == "pool_a" else "B" if pool_name == "pool_b" else "C",
-                     pool_cfg.get("description", "")))
-    conn.commit()
-    conn.close()
+# ── 数据库（委托给 hermes_cfg） ──
+# get_db() 和 init_registry() 已从 hermes_cfg 导入
 
 # ── 自动熔断 + 动态权重（后台线程，每 30s） ──
 _circuit_breaker = None  # 在 main() 中初始化
