@@ -23,7 +23,8 @@
 - v2.11: 反向依赖检查 `check-deps` 命令（Key/URL 被哪些组件引用 + `--auto-sync` 远程同步）
 - v3.0: 拆分 `hermes_cfg/` 配置管理包（原 config_manager 因 PyPI 包名冲突更名）；ConfigLoader 类 + get_db + init_registry
 - v3.1: 拆分 `hermes_fiber/` 运行时包（FiberRuntime 类：fiber 生命周期 + undo 栈 + 全局去重表）
-- v3.2: 拆分 `hermes_api/` HTTP API 层（build_app 函数 + 依赖注入，gateway.py 仅剩 1180 行薄封装）
+- v3.2: 拆分 `hermes_api/` HTTP API 层（build_app 函数 + 依赖注入）
+- v3.3: 拆分 `hermes_ops/` 操作层（CLI 命令 + 健康探测 + 反向依赖检查 + 智能体发现，gateway.py 仅剩 448 行）
 
 ## 组件导出接口
 
