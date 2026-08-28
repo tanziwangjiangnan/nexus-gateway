@@ -1,10 +1,12 @@
-# Hermes Gateway
+# nexus-gateway
+
+> 轻量化模型调度网关 · 三资源池 · 可逆栈 · AI Agent 基础设施
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests](https://img.shields.io/badge/tests-84%20passing-brightgreen.svg)]()
 
-**Hermes Gateway** 是一个模块化 AI 模型池网关，支持多 provider 路由、限流、熔断、Fiber 任务追踪和 undo 撤销栈。  
+**nexus-gateway** 是一个模块化 AI 模型池网关，支持多 provider 路由、限流、熔断、Fiber 任务追踪和 undo 撤销栈。  
 从单体 `gateway.py`（2633 行）拆分为 **6 个独立可发布包**，每个包有独立版本、pyproject.toml 和单元测试。
 
 ---
@@ -43,8 +45,8 @@
 
 ```bash
 # 克隆 → 安装 → 启动
-git clone https://github.com/your-username/hermes-gateway.git
-cd hermes-gateway
+git clone https://github.com/tanziwangjiangnan/nexus-gateway.git
+cd nexus-gateway
 pip install -e ./provider_router -e ./fiber_tree -e ./hermes_fiber -e ./hermes_cfg -e ./hermes_ops -e ./hermes_api
 cp gateway.yaml.example gateway.yaml   # 编辑填入真实密钥
 python gateway.py                      # 启动服务

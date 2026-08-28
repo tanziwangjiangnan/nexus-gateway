@@ -2,7 +2,7 @@
 
 ## 报告漏洞
 
-Hermes Gateway 涉及 API 密钥和 provider 凭证管理。如发现安全漏洞，请按以下步骤报告：
+nexus-gateway 涉及 API 密钥和 provider 凭证管理。如发现安全漏洞，请按以下步骤报告：
 
 1. **请勿公开披露** — 不要提交公开 Issue，不要发到讨论区
 2. **发送邮件至项目维护者**（见 GitHub 仓库主页的联系方式）
