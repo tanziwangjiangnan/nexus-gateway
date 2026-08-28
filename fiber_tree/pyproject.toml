@@ -1,5 +1,5 @@
 [project]
-name = "hermes-fiber-tree"
+name = "ops-fiber-tree"
 version = "2.9.0"
 description = "Hermes FiberTree — 知识图谱存储抽象（FiberTree + Storage + MemoryStorage + SQLiteStorage）"
 requires-python = ">=3.11"

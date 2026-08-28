@@ -1,13 +1,13 @@
 [project]
-name = "hermes-api"
+name = "ops-api"
 version = "3.2.0"
 description = "Hermes API — FastAPI 应用构建器（build_app + 依赖注入），27 个路由"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
-    "hermes-provider-router",
-    "hermes-cfg",
-    "hermes-fiber",
+    "ops-provider-router",
+    "ops-cfg",
+    "ops-fiber",
     "fastapi",
     "uvicorn",
     "httpx",

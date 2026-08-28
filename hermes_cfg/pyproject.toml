@@ -1,11 +1,11 @@
 [project]
-name = "hermes-cfg"
+name = "ops-cfg"
 version = "3.0.0"
 description = "Hermes Config — 配置加载（ConfigLoader + DB 初始化 + registry）"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
-    "hermes-provider-router",
+    "ops-provider-router",
     "PyYAML",
 ]
 
