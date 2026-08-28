@@ -22,6 +22,7 @@
 - v2.10: 接口设计缺陷修复——FiberTree 无状态重构（移除 `_fibers` 类变量和单例）；Storage 抽象完善（`add_global_call_history` / `get_global_call_history` 方法）；Provider Router 可扩展钩子（`select_provider(weight_fn=...)`、`CircuitBreakerMonitor(quality_factor_fn=..., user_factor_fn=..., error_threshold=..., recover_threshold=...)`）
 - v2.11: 反向依赖检查 `check-deps` 命令（Key/URL 被哪些组件引用 + `--auto-sync` 远程同步）
 - v3.0: 拆分 `hermes_cfg/` 配置管理包（原 config_manager 因 PyPI 包名冲突更名）；ConfigLoader 类 + get_db + init_registry
+- v3.1: 拆分 `hermes_fiber/` 运行时包（FiberRuntime 类：fiber 生命周期 + undo 栈 + 全局去重表）
 
 ## 组件导出接口
 
@@ -40,6 +41,11 @@
 ### `fiber_tree/`
 - `FiberTree`（实例变量，无单例，无类共享状态）
 - `Storage`（抽象基类：`create_fiber`, `get_fiber`, `update_fiber`, `delete_fiber`, `add_global_call_history`, `get_global_call_history` 等）
+
+### `hermes_fiber/`（v3.1）
+- `FiberRuntime` 类：fiber 生命周期（create/register/fail/commit），undo 栈（register/pop/clear），全局去重表（lookup/add/remove）
+- `Fiber` dataclass（id, parent_id, agent_id, description, status, undo_log, children, capabilities, call_history, created_at）
+- 与 `fiber_tree/` 的区别：`fiber_tree/` = 持久化存储抽象（数据库层），`hermes_fiber/` = 运行时内存状态
 - `MemoryStorage`, `SQLiteStorage`
 
 ## 关键命令
