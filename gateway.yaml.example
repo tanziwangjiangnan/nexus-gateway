@@ -1,0 +1,23 @@
+# Hermes Gateway 配置模板
+# 复制此文件为 gateway.yaml 并填入真实密钥
+port: 8646
+host: 127.0.0.1
+gateway_key: "${GATEWAY_KEY}"  # 替换为你的网关密钥
+
+providers:
+  example-provider:
+    api: "https://api.example.com/v1"
+    api_key: "${PROVIDER_API_KEY}"  # 通过环境变量引用
+    max_rps: 10
+
+pools:
+  example_pool:
+    description: "示例池"
+    providers:
+      - name: "example-provider"
+        weight: 1
+        models:
+          - "example-model"
+        capabilities:
+          - chat
+          - code

@@ -137,7 +137,7 @@ agents:
   - id: openhands
     display_name: "OpenHands"
     type: openhands
-    workspace: /home/user/openhands/workspace
+    workspace: /path/to/openhands/workspace
     capabilities:
       - read
       - write

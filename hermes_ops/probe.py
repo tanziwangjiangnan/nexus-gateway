@@ -11,7 +11,7 @@ import time
 from hermes_cfg import get_db
 
 # 模块级可覆盖的路径（由 gateway 初始化）
-QQ_PUSH = "/root/experiments/qq-push.sh"
+QQ_PUSH = os.environ.get("HERMES_QQ_PUSH_SCRIPT", "")
 QQ_TARGET = "1310893084"
 
 
