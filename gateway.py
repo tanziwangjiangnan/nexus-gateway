@@ -389,7 +389,9 @@ def main():
                            for pc in _config.get("pools", {}).values()
                            for pv in pc.get("providers", []))
         total_providers = len(_config.get("providers", {}))
-        print(f"🔌 模型池网关 v2 启动: http://{_config.get("host","127.0.0.1")}:{_config.get("port",8646)}")
+        host = os.environ.get("GATEWAY_HOST") or _config.get("host", "127.0.0.1")
+        port = int(os.environ.get("GATEWAY_PORT") or _config.get("port", 8646))
+        print(f"🔌 模型池网关 v2 启动: http://{host}:{port}")
         print(f"   {total_models} 个模型, {total_providers} 个 provider, {len(_config.get("pools",{}))} 个资源池")
         print(f"   SIGHUP 热加载已启用 (kill -HUP {os.getpid()} 重载配置)")
         t = threading.Thread(target=_circuit_breaker_loop, args=(_config,), daemon=True)
@@ -413,7 +415,7 @@ def main():
                 print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 配置重载失败: {e}")
         signal.signal(signal.SIGHUP, _hup)
         try:
-            uvicorn.run(app, host=_config.get("host", "127.0.0.1"), port=_config.get("port", 8646), log_level="info")
+            uvicorn.run(app, host=host, port=port, log_level="info")
         finally:
             pid_file = os.path.join(BASE, "gateway.pid")
             if os.path.exists(pid_file):
