@@ -1,0 +1,33 @@
+# nexus-gateway — Docker Compose 管理服务
+#
+# 启动:   systemctl start gateway-docker
+# 停止:   systemctl stop gateway-docker
+# 状态:   systemctl status gateway-docker
+# 日志:   journalctl -u gateway-docker -f
+#
+# 共存策略:
+#   裸机服务（gateway.service）和容器服务（gateway-docker.service）互斥，
+#   Docker 服务使用与裸机相同的端口（8646/8649）、相同的 data 和 config 挂载。
+#   → 切换时先停一个，再起另一个，零上下文丢失
+
+[Unit]
+Description=模型池网关 v3.10 — Docker 容器化部署
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+WorkingDirectory=/root/experiments/gateway
+
+# 环境变量 — 复用 systemd 的 EnvironmentFile
+EnvironmentFile=/root/.hermes/.env
+
+ExecStart=/usr/bin/docker compose -f /root/experiments/gateway/deploy/docker-compose.yaml up -d
+ExecStop=/usr/bin/docker compose -f /root/experiments/gateway/deploy/docker-compose.yaml down
+
+ExecReload=/usr/bin/docker compose -f /root/experiments/gateway/deploy/docker-compose.yaml restart
+
+[Install]
+WantedBy=multi-user.target

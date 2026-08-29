@@ -1,35 +1,33 @@
-# nexus-gateway — Docker Compose 一键部署
+# nexus-gateway — Docker Compose 部署
 #
 # 启动:   docker compose -f deploy/docker-compose.yaml up -d
 # 停止:   docker compose -f deploy/docker-compose.yaml down
 # 日志:   docker compose -f deploy/docker-compose.yaml logs -f
+# 重建:   docker compose -f deploy/docker-compose.yaml up -d --build
 #
 # 前置条件:
-#   - 在 .env 中配置 provider 密钥（${VAR} 引用，无需硬编码）
-#   - 需要容器发现/日志功能时，需挂载 /var/run/docker.sock
+#   - 在本目录 .env 中配置 provider 密钥（${VAR} 引用，无需硬编码）
+#   - 构建镜像: docker build -t nexus-gateway:v3.10 .
 
 services:
   nexus-gateway:
-    image: nexus-gateway:v3.9
+    image: nexus-gateway:v3.10
     container_name: nexus-gateway
     restart: unless-stopped
     ports:
-      - "8646:8646"            # API 端口（对外）
-      - "8649:8649"            # 直连端点（nginx 重写用）
+      - "8646:8646"            # API 端口（对外，nginx 反向代理到上游）
     environment:
-      # provider 密钥 — 从宿主机环境变量注入（无硬编码）
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
-      QFG_GPT_KEY: ${QFG_GPT_KEY}
-      SCNET_TP_KEY: ${SCNET_TP_KEY}
-      XIAOMI_KEY: ${XIAOMI_KEY}
-      GATEWAY_KEY: ${GATEWAY_KEY}
       TZ: Asia/Shanghai
+      # 覆盖 gateway.yaml 中的 host — 容器内需绑定 0.0.0.0 才能接收外部流量
+      GATEWAY_HOST: 0.0.0.0
+    env_file:
+      # 复用 systemd 的 EnvironmentFile — 密钥来源一致，无需重复配置
+      - /root/.hermes/.env
     volumes:
-      # 配置与数据挂载（宿主机路径可改）
-      - ./config/gateway.yaml:/app/gateway.yaml:ro
-      - ./data:/app/data
-      # 容器化智能体发现/日志（可选）
-      - /var/run/docker.sock:/var/run/docker.sock
+      # 挂载项目根目录（可写）— 容器内路径与裸机进程完全一致
+      # gateway.yaml、gateway.db、quality_benchmark.yaml 都在同一位置
+      # 生产和数据文件共用同一份，停机切换时上下文零丢失
+      - ../:/app
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8646/health', timeout=3)"]
       interval: 30s
