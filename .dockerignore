@@ -1,0 +1,34 @@
+# Git
+.git/
+.gitignore
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+
+# 构建产物
+dist/
+build/
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+env/
+.env
+
+# 本地配置和数据（含真实密钥）
+gateway.yaml
+gateway.db
+gateway.pid
+
+# 日志与临时文件
+logs/
+tmp/
+*.log
+
+# OpenHands agent memory（本地专用）
+.openhands/

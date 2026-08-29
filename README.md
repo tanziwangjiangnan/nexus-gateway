@@ -534,3 +534,96 @@ python3 gateway.py feedback-stats   # 查看用户反馈统计
 ## 安全漏洞
 
 发现安全漏洞请通过 [SECURITY.md](SECURITY.md) 描述的方式报告，请勿公开披露。
+
+## 容器化部署
+
+网关支持 Docker 容器化打包，一个镜像支持两种运行模式。
+
+### 构建镜像
+
+```bash
+docker build -t nexus-gateway:v3.4 .
+# 如需指定平台（阿里云 ECS 通常为 x86_64）
+docker build --platform linux/amd64 -t nexus-gateway:v3.4 .
+```
+
+### 运行方式
+
+**API 服务模式**（默认）：
+
+```bash
+mkdir -p /root/gateway/{config,data,logs}
+cp gateway.yaml.example /root/gateway/config/gateway.yaml  # 编辑填入真实密钥
+
+docker run -d \
+  --name nexus-gateway \
+  -p 8646:8646 \
+  -v /root/gateway/config/gateway.yaml:/app/config/gateway.yaml \
+  -v /root/gateway/data:/app/data \
+  -v /root/gateway/logs:/app/logs \
+  -e CONFIG_PATH=/app/config/gateway.yaml \
+  nexus-gateway:v3.4
+```
+
+**CLI 模式**（执行一次性运维命令）：
+
+```bash
+docker run --rm \
+  -v /root/gateway/config/gateway.yaml:/app/config/gateway.yaml \
+  -v /root/gateway/data:/app/data \
+  nexus-gateway:v3.4 \
+  python3 gateway.py check-deps
+```
+
+### 配置与数据挂载
+
+| 宿主机路径 | 容器内路径 | 内容 |
+|-----------|-----------|------|
+| `/root/gateway/config/gateway.yaml` | `/app/config/gateway.yaml` | 配置文件（外置，不含密钥） |
+| `/root/gateway/data/` | `/app/data/` | SQLite 数据库（持久化） |
+| `/root/gateway/logs/` | `/app/logs/` | 日志输出（可选） |
+
+## 容器化智能体接入
+
+网关支持发现并调用运行在 Docker 容器中的智能体（OpenHands / AstrBot 等），无需手动指定 IP。
+
+### 配置示例
+
+```yaml
+agents:
+  # Docker 容器（通过容器名自动发现 base_url）
+  - id: openhands-docker
+    type: openhands
+    container_name: openhands-dev        # Docker 容器名
+    # 可选：显式指定 base_url 则跳过自动发现
+    # base_url: http://openhands:8863
+
+  # Docker Compose 服务
+  - id: astrbot-docker
+    type: astrbot
+    compose_project: astrbot
+    compose_service: bot
+
+  # 本地进程（原有方式不变）
+  - id: openhands-local
+    type: openhands
+    workspace: /home/user/openhands/workspace
+```
+
+### 发现优先级
+
+| 声明方式 | 解析方法 |
+|---------|---------|
+| `base_url` | 显式指定，直接使用（最高优先级） |
+| `container_name` / `container_id` | `docker inspect` 查询容器 IP 和端口 |
+| `compose_project` + `compose_service` | `docker compose ps` 解析容器，走 Compose 网络 |
+| `workspace` | 原有本地文件系统发现逻辑 |
+
+### 状态与日志
+
+- **状态探测**：`GET /admin/agents/status` — 容器化智能体通过 `docker inspect` 解析 base_url 后探测 `GET /health`
+- **日志聚合**：`GET /admin/logs` — 容器化智能体通过 `docker logs <container>` 获取日志
+
+> 注意：镜像内使用 docker CLI（`docker.io-cli` 包）而非 Docker SDK。运行时需挂载
+> `/var/run/docker.sock` 才能访问宿主机 Docker：
+> `-v /var/run/docker.sock:/var/run/docker.sock`

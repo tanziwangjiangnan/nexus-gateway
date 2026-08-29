@@ -1,15 +1,19 @@
-# Hermes Gateway 配置模板
+# nexus-gateway 配置模板
 # 复制此文件为 gateway.yaml 并填入真实密钥
+
+# ── 基础配置 ──
 port: 8646
 host: 127.0.0.1
 gateway_key: "${GATEWAY_KEY}"  # 替换为你的网关密钥
 
+# ── Provider 配置 ──
 providers:
   example-provider:
     api: "https://api.example.com/v1"
     api_key: "${PROVIDER_API_KEY}"  # 通过环境变量引用
     max_rps: 10
 
+# ── 资源池 ──
 pools:
   example_pool:
     description: "示例池"
@@ -21,3 +25,30 @@ pools:
         capabilities:
           - chat
           - code
+
+# ── 智能体声明 ──
+# 本地智能体（通过 workspace 发现）
+# agents:
+#   - id: openhands-local
+#     type: openhands
+#     workspace: /home/user/openhands/workspace
+#     capabilities: [read, write, execute]
+
+# 容器化智能体（通过 Docker 自动发现 base_url）
+# agents:
+#   - id: openhands-docker
+#     type: openhands
+#     container_name: openhands-dev        # 通过容器名发现
+#     capabilities: [read, write, execute]
+#
+#   - id: astrbot-docker
+#     type: astrbot
+#     compose_project: astrbot             # Docker Compose 项目名
+#     compose_service: bot                 # 服务名
+#     capabilities: [read]
+#
+#   - id: custom-agent
+#     type: generic
+#     container_id: abc123def456           # 容器 ID（备用）
+#     port: 8080                           # 容器内 HTTP 端口（可选）
+#     capabilities: [read]

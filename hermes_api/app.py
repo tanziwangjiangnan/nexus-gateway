@@ -1094,6 +1094,8 @@ def build_app(cfg, deps):
         - openhands: 检查 workspace 下是否有锁文件或 PID
         - astrbot: GET base_url/health，超时 2s
         - generic: 检查 pid_file 是否存在且进程存活
+        - docker 容器（container_name / container_id / compose_project）:
+          先 resolve 出 base_url，再 GET /health
         """
         agents = cfg.get("agents", [])
         results = []
@@ -1104,7 +1106,28 @@ def build_app(cfg, deps):
             detail = ""
 
             try:
-                if atype == "openhands":
+                if agent.get("container_name") or agent.get("container_id") or agent.get("compose_project"):
+                    # 容器化智能体（最高优先级）— 通过 Docker 解析 base_url 后探测
+                    try:
+                        from hermes_ops.agent_discovery import resolve_agent_target
+                        url, method = resolve_agent_target(agent)
+                        if url:
+                            try:
+                                async with httpx.AsyncClient(timeout=3) as client:
+                                    resp = await client.get(f"{url}/health")
+                                    status = "online" if resp.status_code < 500 else "degraded"
+                                    detail = f"{method}:{url} http_{resp.status_code}"
+                            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                                status = "offline"
+                                detail = f"{method}:{url} {str(e)[:50]}"
+                        else:
+                            status = "offline"
+                            detail = f"resolve_failed:{method}"
+                    except Exception as e:
+                        status = "error"
+                        detail = str(e)[:50]
+
+                elif atype == "openhands":
                     ws = agent.get("workspace", "")
                     # 检查锁文件或 PID 文件
                     lock_file = os.path.join(ws, ".openhands.lock") if ws else ""
@@ -1194,7 +1217,36 @@ def build_app(cfg, deps):
             aid = agent.get("id", "unknown")
             atype = agent.get("type", "generic")
             try:
-                if atype == "openhands":
+                if agent.get("container_name") or agent.get("container_id") or agent.get("compose_project"):
+                    # 容器化智能体（最高优先级）— 通过 docker logs 获取日志
+                    container = agent.get("container_name") or agent.get("container_id")
+                    if not container and agent.get("compose_project"):
+                        try:
+                            from hermes_ops.agent_discovery import _docker
+                            ok, out = _docker("compose", "-p", agent["compose_project"], "ps", "-q",
+                                              agent.get("compose_service", ""))
+                            container = out.splitlines()[0] if ok and out.strip() else ""
+                        except Exception:
+                            container = ""
+                    if container:
+                        try:
+                            r = subprocess.run(
+                                ["docker", "logs", "--tail", str(max_lines), "-t", container],
+                                capture_output=True, text=True, timeout=10,
+                            )
+                            raw = r.stdout + r.stderr
+                            for line in raw.split("\n")[-max_lines:]:
+                                if not line.strip():
+                                    continue
+                                parsed = _parse_log_line(line, aid, "docker")
+                                if parsed and _log_matches(parsed, filter_levels, since_str):
+                                    all_entries.append(parsed)
+                        except Exception as e:
+                            errors.append({"agent_id": aid, "error": f"docker logs: {str(e)[:80]}"})
+                    else:
+                        errors.append({"agent_id": aid, "error": "docker logs: container 解析失败"})
+
+                elif atype == "openhands":
                     ws = agent.get("workspace", "")
                     log_dirs = [
                         os.path.join(ws, "logs"),
