@@ -1,0 +1,56 @@
+# nexus-gateway — 部署配置示例
+# 复制为 .env 并填入真实密钥:
+#   cp deploy/config/gateway.yaml.example deploy/config/gateway.yaml
+#   cp .env.example .env
+#
+# 密钥不硬编码, 统一通过环境变量 ${VAR} 引用
+
+gateway_key: ${GATEWAY_KEY}
+host: 0.0.0.0
+port: 8646
+
+pools:
+  pool_a:
+    description: 日常对话池
+    providers:
+      - name: scnet-tp
+        weight: 5
+        models: [DeepSeek-V4-Flash, GLM-5.2]
+        capabilities: [chat, code]
+      - name: xiaomi
+        weight: 2
+        models: [mimo-v2.5-pro]
+        capabilities: [chat]
+  pool_b:
+    description: 增强/需审批池
+    fallback: pool_c
+    providers:
+      - name: qfg-codex
+        weight: 3
+        models: [codex-v1]
+        capabilities: [chat, code]
+  pool_c:
+    description: 快速验证池
+    providers:
+      - name: deepseek-direct
+        weight: 1
+        models: [deepseek-v4]
+        capabilities: [chat]
+
+providers:
+  deepseek-direct:
+    api: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_API_KEY}
+    max_rps: 50
+  qfg-codex:
+    api: https://api.qfg.cn/v1
+    api_key: ${QFG_GPT_KEY}
+    max_rps: 30
+  scnet-tp:
+    api: https://api.scnet.cn/api/llm/v1
+    api_key: ${SCNET_TP_KEY}
+    max_rps: 100
+  xiaomi:
+    api: https://api.xiaomi.com/v1
+    api_key: ${XIAOMI_KEY}
+    max_rps: 100

@@ -1,0 +1,78 @@
+# nexus-gateway — ACK ConfigMap
+#
+# 使用方式:
+#   1. 将生产 gateway.yaml 的 providers 段中 api_key 改为 ${VAR} 引用
+#   2. 密钥通过 Secret 注入（见 deployment.yaml 的 envFrom）
+#   3. 应用: kubectl apply -f deploy/k8s/configmap.yaml
+#
+# 注意: 不要在此文件中硬编码真实密钥
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nexus-gateway-config
+  namespace: nexus-gateway
+  labels:
+    app: nexus-gateway
+data:
+  gateway.yaml: |
+    gateway_key: ${GATEWAY_KEY}
+    host: 0.0.0.0
+    port: 8646
+
+    pools:
+      pool_a:
+        description: 日常对话池
+        providers:
+          - name: scnet-tp
+            weight: 5
+            models:
+              - DeepSeek-V4-Flash
+              - GLM-5.2
+            capabilities:
+              - chat
+              - code
+          - name: xiaomi
+            weight: 2
+            models:
+              - mimo-v2.5-pro
+            capabilities:
+              - chat
+      pool_b:
+        description: 增强/需审批池
+        fallback: pool_c
+        providers:
+          - name: qfg-codex
+            weight: 3
+            models:
+              - codex-v1
+            capabilities:
+              - chat
+              - code
+      pool_c:
+        description: 快速验证池
+        providers:
+          - name: deepseek-direct
+            weight: 1
+            models:
+              - deepseek-v4
+            capabilities:
+              - chat
+
+    providers:
+      deepseek-direct:
+        api: https://api.deepseek.com/v1
+        api_key: ${DEEPSEEK_API_KEY}
+        max_rps: 50
+      qfg-codex:
+        api: https://api.qfg.cn/v1
+        api_key: ${QFG_GPT_KEY}
+        max_rps: 30
+      scnet-tp:
+        api: https://api.scnet.cn/api/llm/v1
+        api_key: ${SCNET_TP_KEY}
+        max_rps: 100
+      xiaomi:
+        api: https://api.xiaomi.com/v1
+        api_key: ${XIAOMI_KEY}
+        max_rps: 100

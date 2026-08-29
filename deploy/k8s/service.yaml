@@ -1,0 +1,22 @@
+# nexus-gateway — ACK Service
+#
+# ClusterIP 供集群内部调用; 如需对外暴露, 见 ingress.yaml 或改为 LoadBalancer
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: nexus-gateway
+  namespace: nexus-gateway
+  labels:
+    app: nexus-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app: nexus-gateway
+  ports:
+    - name: api
+      port: 8646
+      targetPort: 8646
+    - name: direct
+      port: 8649
+      targetPort: 8649

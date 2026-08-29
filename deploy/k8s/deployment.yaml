@@ -1,0 +1,85 @@
+# nexus-gateway — ACK Deployment
+#
+# 前置条件: 创建 Secret 存放 provider 密钥（不要硬编码在 YAML 中）
+#   kubectl create secret generic nexus-gateway-secrets \
+#     --namespace nexus-gateway \
+#     --from-literal=DEEPSEEK_API_KEY='ds-xxx' \
+#     --from-literal=QFG_GPT_KEY='qfg-xxx' \
+#     --from-literal=SCNET_TP_KEY='scnet-xxx' \
+#     --from-literal=XIAOMI_KEY='xiaomi-xxx' \
+#     --from-literal=GATEWAY_KEY='gw-xxx'
+#
+# 应用: kubectl apply -f deploy/k8s/
+# 扩容: kubectl scale deployment nexus-gateway -n nexus-gateway --replicas=3
+# 回滚: kubectl rollout undo deployment nexus-gateway -n nexus-gateway
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nexus-gateway
+  namespace: nexus-gateway
+  labels:
+    app: nexus-gateway
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: nexus-gateway
+  template:
+    metadata:
+      labels:
+        app: nexus-gateway
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: nexus-gateway
+          image: nexus-gateway:v3.9
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8646
+              name: api
+            - containerPort: 8649
+              name: direct
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+          envFrom:
+            - secretRef:
+                name: nexus-gateway-secrets
+          volumeMounts:
+            - name: config
+              mountPath: /app/gateway.yaml
+              subPath: gateway.yaml
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: 2000m
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8646
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8646
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: nexus-gateway-config
+        - name: data
+          emptyDir: {}

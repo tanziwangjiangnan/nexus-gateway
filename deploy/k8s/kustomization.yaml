@@ -1,0 +1,17 @@
+# nexus-gateway — ACK Kustomize
+#
+# 一键部署全部 K8s 资源:
+#   kubectl apply -k deploy/k8s/
+#
+# 前置条件: 先创建 Secret（见 deployment.yaml 注释）
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nexus-gateway
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
