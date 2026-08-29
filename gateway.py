@@ -65,9 +65,9 @@ import httpx
 # ── 组件包导入 ──
 from provider_router import Router, RouterState, CircuitBreakerMonitor
 from fiber_tree import FiberTree, MemoryStorage
-from hermes_cfg import ConfigLoader, get_db, init_registry
-from hermes_fiber import FiberRuntime
-from hermes_ops.check_deps import check_deps_on_diff
+from ops_gateway_core import ConfigLoader, get_db, init_registry
+from ops_gateway_core.fiber import FiberRuntime
+from ops_gateway_core.ops.check_deps import check_deps_on_diff
 
 # ── 路径 ──
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -317,7 +317,7 @@ def check_rate_limit(provider_name, max_rps):
 # ── FastAPI 应用 ──
 def create_app(cfg):
     """构建 FastAPI 应用实例（薄封装，委托给 hermes_api.build_app）。"""
-    from hermes_api import build_app
+    from ops_gateway_core import build_app
     deps = {
         "disabled_providers": _disabled_providers,
         "router_state": _router_state,
@@ -359,7 +359,7 @@ def main():
     os.makedirs(BASE, exist_ok=True)
     init_registry(_config)
 
-    from hermes_ops import (
+    from ops_gateway_core import (
         probe_all, cmd_models, cmd_usage,
         cmd_quality, cmd_feedback_stats,
         cmd_git_log, cmd_git_diff,
