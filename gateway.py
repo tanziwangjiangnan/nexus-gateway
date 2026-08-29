@@ -81,6 +81,7 @@ _rate_limit_buckets = {}        # {provider_name: [t1, t2, ...]}
 _dynamic_weights = {}           # {provider_name: effective_weight} 由熔断线程更新
 _quality_factors = {}           # {provider_name: float} 质量信誉因子（检查者评分驱动）
 _user_factors = {}              # {provider_name: float} 用户信誉因子（用户反馈驱动）
+_benchmark_loaded = False       # 是否加载了基准评分（为 True 时跳过在线评分）
 _approval_cache = {}            # {(agent_id, action_hash): expiry_timestamp}
 _pending_approvals = {}         # {action_id: {action, params, agent_id}}
 _lock = threading.Lock()
@@ -346,6 +347,7 @@ def create_app(cfg):
         "check_rate_limit": check_rate_limit,
         "quality_factors": _quality_factors,
         "user_factors": _user_factors,
+        "benchmark_loaded": _benchmark_loaded,
         "log_matches": _log_matches,
         "parse_log_line": _parse_log_line,
     }
@@ -367,12 +369,19 @@ def main():
         cmd_undo_remote, cmd_undo_list_remote,
         cmd_fiber_view,
         cmd_check_deps, cmd_scan_agents,
+        cmd_benchmark, load_quality_benchmark,
     )
 
     args = sys.argv[1:]
 
     if not args:
         import uvicorn
+
+        # 加载基准评分（如有），填充 quality_factors 后禁用在线评分
+        bench_qf = load_quality_benchmark(BASE)
+        if bench_qf:
+            _quality_factors.update(bench_qf)
+        _benchmark_loaded = bench_qf is not None
         app = create_app(_config)
         with open(os.path.join(BASE, "gateway.pid"), "w") as f:
             f.write(str(os.getpid()))
@@ -458,6 +467,17 @@ def main():
             if idx + 1 < len(args):
                 scan_dir = args[idx + 1]
         cmd_scan_agents(_config, BASE, CONFIG_PATH, scan_dir=scan_dir)
+    elif args[0] == "benchmark":
+        provider_filter = None
+        scoring_model = None
+        for a in args[1:]:
+            if a.startswith("--provider="):
+                provider_filter = a.split("=", 1)[1]
+            elif a.startswith("--model="):
+                scoring_model = a.split("=", 1)[1]
+            elif a == "--all":
+                pass
+        cmd_benchmark(_config, BASE, provider_filter=provider_filter, scoring_model=scoring_model)
     else:
         print(f"未知命令: {args[0]}")
 
