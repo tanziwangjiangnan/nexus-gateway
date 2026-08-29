@@ -537,51 +537,72 @@ python3 gateway.py feedback-stats   # 查看用户反馈统计
 
 ## 容器化部署
 
-网关支持 Docker 容器化打包，一个镜像支持两种运行模式。
+网关支持三种部署方式，**可共存，按需选择**。
 
-### 构建镜像
-
-```bash
-docker build -t nexus-gateway:v3.4 .
-# 如需指定平台（阿里云 ECS 通常为 x86_64）
-docker build --platform linux/amd64 -t nexus-gateway:v3.4 .
-```
-
-### 运行方式
-
-**API 服务模式**（默认）：
+### 方式一：Docker Compose（推荐，单机一键部署）
 
 ```bash
-mkdir -p /root/gateway/{config,data,logs}
-cp gateway.yaml.example /root/gateway/config/gateway.yaml  # 编辑填入真实密钥
+# 1. 准备环境变量
+cp deploy/.env.example .env
+# 编辑 .env 填入真实 provider 密钥
 
-docker run -d \
-  --name nexus-gateway \
-  -p 8646:8646 \
-  -v /root/gateway/config/gateway.yaml:/app/config/gateway.yaml \
-  -v /root/gateway/data:/app/data \
-  -v /root/gateway/logs:/app/logs \
-  -e CONFIG_PATH=/app/config/gateway.yaml \
-  nexus-gateway:v3.4
+# 2. 构建镜像
+docker build -t nexus-gateway:v3.9 .
+
+# 3. 启动
+docker compose -f deploy/docker-compose.yaml up -d
 ```
 
-**CLI 模式**（执行一次性运维命令）：
+### 方式二：K8s / ACK（集群部署）
 
 ```bash
-docker run --rm \
-  -v /root/gateway/config/gateway.yaml:/app/config/gateway.yaml \
-  -v /root/gateway/data:/app/data \
-  nexus-gateway:v3.4 \
-  python3 gateway.py check-deps
+# 1. 创建密钥（不要硬编码在 YAML 中）
+kubectl create secret generic nexus-gateway-secrets \
+  --namespace nexus-gateway \
+  --from-literal=DEEPSEEK_API_KEY='ds-xxx' \
+  --from-literal=QFG_GPT_KEY='qfg-xxx' \
+  --from-literal=SCNET_TP_KEY='scnet-xxx' \
+  --from-literal=XIAOMI_KEY='xiaomi-xxx' \
+  --from-literal=GATEWAY_KEY='gw-xxx'
+
+# 2. 一键部署全部资源
+kubectl apply -k deploy/k8s/
+
+# 3. 验证
+kubectl get pods -n nexus-gateway
 ```
 
-### 配置与数据挂载
+### 方式三：裸机/进程（原方式，不变）
 
-| 宿主机路径 | 容器内路径 | 内容 |
-|-----------|-----------|------|
-| `/root/gateway/config/gateway.yaml` | `/app/config/gateway.yaml` | 配置文件（外置，不含密钥） |
-| `/root/gateway/data/` | `/app/data/` | SQLite 数据库（持久化） |
-| `/root/gateway/logs/` | `/app/logs/` | 日志输出（可选） |
+```bash
+pip install --no-deps -e ./ops-gateway-core
+python3 gateway.py
+```
+
+### 完整部署文件
+
+```
+deploy/
+├── .env.example                  # 环境变量模板
+├── README.md                     # 部署文档
+├── config/
+│   └── gateway.yaml.example      # 配置模板（${VAR} 引用，无硬编码）
+├── docker-compose.yaml           # Docker Compose 一键部署
+└── k8s/
+    ├── kustomization.yaml        # Kustomize 入口
+    ├── namespace.yaml            # 独立命名空间
+    ├── configmap.yaml            # 配置（不含密钥）
+    ├── deployment.yaml           # 工作负载 + 滚动更新 + 探针
+    ├── service.yaml              # ClusterIP 服务
+    └── ingress.yaml              # nginx 对外暴露
+```
+
+### 设计要点
+
+- **无硬编码密钥**：所有 `api_key` 统一使用 `${VAR}` 环境变量引用，密钥通过 Secret（K8s）或 .env（Compose）注入
+- **健康检查**：K8s 使用 liveness + readiness 探针；Compose 使用 healthcheck
+- **滚动更新**：K8s 配置 RollingUpdate（maxUnavailable=0），确保零停机
+- **配置热加载**：网关支持 SIGHUP 热加载配置，无需重启 Pod
 
 ## 容器化智能体接入
 
