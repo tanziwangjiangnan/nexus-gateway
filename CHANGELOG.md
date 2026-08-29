@@ -1,4 +1,25 @@
 # Changelog
+
+## v3.9 (2026-08-29)
+
+### 重构
+- 新增 `ops-gateway-core` 合并包：将 `hermes_cfg/fiber/api/ops` 四个子包合并为单一 `ops_gateway_core` 包（4 个子模块：`cfg/fiber/api/ops`）
+- 新增 `nexus-gateway` 聚合包：依赖 `ops-gateway-core` + `ops-provider-router` + `ops-fiber-tree`，一键安装全部组件
+- 原 4 包保留为 shim（从 `ops-gateway-core` 重新导出），旧导入路径 `from hermes_cfg import ...` 仍可用
+
+### 新增
+- `deploy/` 目录：Docker Compose 一键部署 + K8s/ACK 全套编排（namespace/configmap/deployment/service/ingress/kustomization）
+- `deploy/.env.example` 环境变量模板，`deploy/config/gateway.yaml.example` 配置模板（无硬编码密钥）
+
+### 安全
+- 所有 `api_key` 统一使用 `${VAR}` 环境变量引用，密钥通过 Secret（K8s）或 .env（Compose）注入
+- 无硬编码密钥/路径，git 历史无敏感信息
+
+### 部署
+- 三种部署方式共存：Docker Compose / K8s(ACK) / 裸机进程（原方式不变）
+- Dockerfile 更新（tag v3.9，安装新包）
+- 零影响现有组件部署架构
+
 ## v0.3.1 (2026-08-29)
 
 ### 修复

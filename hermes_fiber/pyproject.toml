@@ -1,6 +1,6 @@
 [project]
 name = "ops-fiber"
-version = "3.1.0"
+version = "3.9.0"
 description = "Hermes FiberRuntime — 运行时 Fiber 生命周期管理 + undo 栈 + 全局去重表"
 requires-python = ">=3.11"
 license = {text = "MIT"}

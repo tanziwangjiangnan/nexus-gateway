@@ -1,6 +1,6 @@
 [project]
 name = "ops-api"
-version = "3.2.0"
+version = "3.9.0"
 description = "Hermes API — FastAPI 应用构建器（build_app + 依赖注入），27 个路由"
 requires-python = ">=3.11"
 license = {text = "MIT"}
