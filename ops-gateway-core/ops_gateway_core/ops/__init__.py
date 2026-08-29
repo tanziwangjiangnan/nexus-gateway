@@ -19,6 +19,7 @@ from .commands import (
 from .check_deps import cmd_check_deps
 from .scan_agents import cmd_scan_agents
 from .agent_discovery import resolve_agent_target, resolve_by_docker, resolve_by_compose
+from .benchmark import cmd_benchmark, load_quality_benchmark, BENCHMARK_QUESTIONS, BENCHMARK_FILENAME
 
 __all__ = [
     "probe_model", "probe_all", "call_provider_http",
@@ -28,4 +29,5 @@ __all__ = [
     "cmd_check_deps",
     "cmd_scan_agents",
     "resolve_agent_target", "resolve_by_docker", "resolve_by_compose",
+    "cmd_benchmark", "load_quality_benchmark", "BENCHMARK_QUESTIONS", "BENCHMARK_FILENAME",
 ]

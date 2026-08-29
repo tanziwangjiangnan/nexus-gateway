@@ -321,6 +321,7 @@ def build_app(cfg, deps):
     select_provider_with_runner_up = deps["select_provider_with_runner_up"]
     check_rate_limit = deps["check_rate_limit"]
     _quality_factors = deps["quality_factors"]
+    _benchmark_loaded = deps.get("benchmark_loaded", False)
     _user_factors = deps["user_factors"]
     _log_matches = deps["log_matches"]
     _parse_log_line = deps["parse_log_line"]
@@ -688,7 +689,8 @@ def build_app(cfg, deps):
                     app.state.req_duration.labels(provider=pv["name"]).observe(time.time() - t0)
                     # 第二名检查者：自适应采样频率
                     # 默认开启，冷启动每次都审 → 稳态概率衰减 → 大变量强制复审
-                    if runner_up and not user_key:
+                    # 若已加载基准评分（benchmark_loaded），跳过在线评分，零 Token 开销
+                    if runner_up and not user_key and not _benchmark_loaded:
                         decision, reason = _should_score(cfg, pv["name"], runner_up, _scoring_state)
                         if decision:
                             asyncio.get_event_loop().create_task(

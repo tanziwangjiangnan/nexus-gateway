@@ -30,6 +30,10 @@ from .ops import (
     resolve_agent_target,
     resolve_by_docker,
     resolve_by_compose,
+    cmd_benchmark,
+    load_quality_benchmark,
+    BENCHMARK_QUESTIONS,
+    BENCHMARK_FILENAME,
 )
 
 __all__ = [
@@ -42,4 +46,5 @@ __all__ = [
     "cmd_undo_remote", "cmd_undo_list_remote", "cmd_fiber_view",
     "cmd_check_deps", "cmd_scan_agents",
     "resolve_agent_target", "resolve_by_docker", "resolve_by_compose",
+    "cmd_benchmark", "load_quality_benchmark", "BENCHMARK_QUESTIONS", "BENCHMARK_FILENAME",
 ]
