@@ -1,6 +1,6 @@
 """测试 hermes_cfg 包：ConfigLoader + get_db"""
 import pytest, os, tempfile, yaml
-from hermes_cfg import ConfigLoader, get_db, init_registry
+from ops_gateway_core import ConfigLoader, get_db, init_registry
 
 MINIMAL_CONFIG = {
     "port": 8646,

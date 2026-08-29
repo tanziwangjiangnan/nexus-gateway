@@ -1,7 +1,7 @@
 """测试 hermes_api 包：build_app"""
 import pytest, threading
 from prometheus_client import REGISTRY
-from hermes_api import build_app, _should_score, _score_by_runner_up
+from ops_gateway_core import build_app, _should_score, _score_by_runner_up
 
 
 # 每个测试前重置 prometheus 注册表，避免重复注册错误

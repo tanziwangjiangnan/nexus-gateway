@@ -5,6 +5,7 @@ description = "Hermes Config — 配置加载（ConfigLoader + DB 初始化 + re
 requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
+    "ops-gateway-core",
     "ops-provider-router",
     "PyYAML",
 ]

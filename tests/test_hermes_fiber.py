@@ -1,6 +1,6 @@
 """测试 hermes_fiber 包：FiberRuntime"""
 import pytest, threading
-from hermes_fiber import FiberRuntime, Fiber
+from ops_gateway_core.fiber import FiberRuntime, Fiber
 
 
 @pytest.fixture

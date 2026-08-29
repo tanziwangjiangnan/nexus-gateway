@@ -5,6 +5,7 @@ description = "Hermes API — FastAPI 应用构建器（build_app + 依赖注入
 requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
+    "ops-gateway-core",
     "ops-provider-router",
     "ops-cfg",
     "ops-fiber",

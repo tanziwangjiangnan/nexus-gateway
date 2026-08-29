@@ -1,8 +1,8 @@
 """测试 hermes_ops 包：CLI 命令"""
 import pytest, io, contextlib, tempfile, os
-from hermes_ops import cmd_models, cmd_usage, cmd_quality, cmd_feedback_stats, cmd_check_deps, cmd_scan_agents
-from hermes_ops.check_deps import collect_all_keys, scan_local
-from hermes_cfg import get_db
+from ops_gateway_core import cmd_models, cmd_usage, cmd_quality, cmd_feedback_stats, cmd_check_deps, cmd_scan_agents
+from ops_gateway_core.ops.check_deps import collect_all_keys, scan_local
+from ops_gateway_core import get_db
 
 # 使用临时文件作为共享 DB，避免 :memory: 连接隔离问题
 _TMP_DB = tempfile.NamedTemporaryFile(suffix=".db", delete=False)

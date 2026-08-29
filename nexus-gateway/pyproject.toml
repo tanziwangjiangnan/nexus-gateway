@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nexus-gateway"
+version = "0.3.9"
+description = "Hermes 网关聚合包 — 一键安装全部组件（核心 + 路由 + Fiber 树）"
+requires-python = ">=3.10"
+
+dependencies = [
+    "ops-gateway-core",
+    "ops-provider-router",
+    "ops-fiber-tree",
+]

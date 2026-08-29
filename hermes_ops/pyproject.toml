@@ -5,6 +5,7 @@ description = "Hermes Ops — CLI 操作命令 + 健康探测 + 反向依赖检�
 requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = [
+    "ops-gateway-core",
     "ops-cfg",
     "PyYAML",
 ]
