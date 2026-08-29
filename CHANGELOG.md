@@ -1,4 +1,14 @@
 # Changelog
+## v0.3.1 (2026-08-29)
+
+### 修复
+- 中转链路：gateway.yaml 改用 ${VAR} 环境变量引用，scnet 路径修正为 /api/llm/v1，app.py 补上 resolve_env_key()
+- 实验网关 gateway_key 改为生产 key（与 hermes.jiangnande.cloud 一致）
+
+### 新增
+- 配置变更下游感知：check_deps_on_diff() 注入 SIGHUP 热加载，变更前自动扫描下游引用
+- 扫描范围扩展：~/.hermes/config.yaml 和 ~/.hermes/.env
+
 
 ## v0.3.0 (2026-08-13)
 
