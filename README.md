@@ -1,6 +1,5 @@
-# nexus-gateway
+# nexus-gateway — 轻量化模型调度网关 · 三资源池 · 可逆栈 · AI Agent 基础设施
 
-> 轻量化模型调度网关 · 三资源池 · 可逆栈 · AI Agent 基础设施
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
