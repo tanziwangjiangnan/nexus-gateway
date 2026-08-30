@@ -27,9 +27,10 @@ services:
     env_file:
       - .env
     volumes:
-      - ./gateway/config:/app/config:ro
-      - ./gateway/data:/app/data
-      - ./gateway/logs:/app/logs
+      # 子目录挂载（config / data / logs 分离），路径相对 compose 文件所在目录
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8646/health', timeout=3)"]
       interval: 30s
