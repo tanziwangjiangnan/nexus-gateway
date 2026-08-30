@@ -1,0 +1,38 @@
+# nexus-gateway — Docker Compose 部署（ACK / 老机生产）
+#
+# 与本地 compose 的区别：
+#   - 子目录挂载（config / data / logs 分离），通过 GATEWAY_CONFIG_PATH/DB_PATH 环境变量覆盖路径
+#   - 镜像由阿里云镜像仓库拉取，而非本地构建
+#
+# 使用前准备:
+#   mkdir -p /opt/containers/gateway/{config,data,logs}
+#   cp gateway.yaml        /opt/containers/gateway/config/
+#   cp gateway.db          /opt/containers/gateway/data/
+#   cp .env                /opt/containers/gateway/.env
+#
+# 启动:   docker compose -f docker-compose.ack.yaml up -d
+
+services:
+  nexus-gateway:
+    image: nexus-gateway:v3.10
+    container_name: nexus-gateway
+    restart: unless-stopped
+    ports:
+      - "8646:8646"
+    environment:
+      TZ: Asia/Shanghai
+      GATEWAY_HOST: 0.0.0.0
+      GATEWAY_CONFIG_PATH: /app/config/gateway.yaml
+      GATEWAY_DB_PATH: /app/data/gateway.db
+    env_file:
+      - .env
+    volumes:
+      - ./gateway/config:/app/config:ro
+      - ./gateway/data:/app/data
+      - ./gateway/logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8646/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

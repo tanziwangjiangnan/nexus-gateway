@@ -69,10 +69,10 @@ from ops_gateway_core import ConfigLoader, get_db, init_registry
 from ops_gateway_core.fiber import FiberRuntime
 from ops_gateway_core.ops.check_deps import check_deps_on_diff
 
-# ── 路径 ──
+# ── 路径（环境变量可覆盖，用于容器化部署时指向子目录） ──
 BASE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE, "gateway.yaml")
-DB = os.path.join(BASE, "gateway.db")
+CONFIG_PATH = os.environ.get("GATEWAY_CONFIG_PATH") or os.path.join(BASE, "gateway.yaml")
+DB = os.environ.get("GATEWAY_DB_PATH") or os.path.join(BASE, "gateway.db")
 
 # ── 全局运行时状态 ──
 _config = {}                    # 当前配置
