@@ -14,7 +14,7 @@
 
 services:
   nexus-gateway:
-    image: nexus-gateway:v3.10
+    image: nexus-gateway:v3.11
     container_name: nexus-gateway
     restart: unless-stopped
     ports:

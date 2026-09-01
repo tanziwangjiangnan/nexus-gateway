@@ -26,6 +26,20 @@ pools:
           - chat
           - code
 
+# ── 路由策略（v3.11 可插拔模型路由） ──
+# mode:
+#   formula — 默认，确定性权重轮询（静态权重 × 动态因子 × 质量因子 × 用户因子）
+#   model   — 调用外部路由模型服务做决策；失败时按 fallback 处理
+#   hybrid  — 优先模型路由，失败自动降级 formula
+routing_strategy:
+  mode: formula
+  model_router:
+    endpoint: "http://127.0.0.1:9090/v1/route"   # 外部路由模型服务
+    timeout_ms: 500
+    fallback: formula        # model 模式下失效策略: formula=降级 | error=直接 503
+    cache_enabled: true      # 相同 query 在 TTL 内复用路由决策
+    cache_ttl_seconds: 300
+
 # ── 智能体声明 ──
 # 本地智能体（通过 workspace 发现）
 # agents:

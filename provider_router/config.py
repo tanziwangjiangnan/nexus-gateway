@@ -26,4 +26,20 @@ def load_config(path: str, providers_override: dict = None) -> dict:
     # 如果有覆盖，合并到 providers 段
     if providers_override:
         cfg.setdefault("providers", {}).update(providers_override)
+    # ── 解析 routing_strategy 配置段（v2.8 模型路由） ──
+    raw = cfg.get("routing_strategy", {})
+    mode = raw.get("mode", "formula")
+    model_router = raw.get("model_router", {})
+    formula = raw.get("formula", {})
+    cfg["routing_strategy"] = {
+        "mode": mode,
+        "model_router": {
+            "endpoint": model_router.get("endpoint", ""),
+            "timeout_ms": model_router.get("timeout_ms", 500),
+            "fallback": model_router.get("fallback", "formula"),
+            "cache_enabled": model_router.get("cache_enabled", True),
+            "cache_ttl_seconds": model_router.get("cache_ttl_seconds", 300),
+        },
+        "formula": formula,
+    }
     return cfg

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ops-gateway-core"
-version = "0.3.9"
+version = "0.4.0"
 description = "Hermes 网关核心：配置、Fiber 运行时、API、操作层（合并包）"
 requires-python = ">=3.10"
 

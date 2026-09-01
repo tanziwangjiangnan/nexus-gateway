@@ -92,6 +92,30 @@ curl http://127.0.0.1:8646/health
 - **池间**：pool_a(日常) → pool_b(增强) → pool_c(兜底)
 - **熔断**：后台线程每 30s 扫描 5 分钟窗口，错误率 >20% 自动禁用，<10% 恢复
 
+## 路由策略（v3.11 可插拔）
+
+`routing_strategy.mode` 控制 provider 选择方式（三选一）：
+
+| mode | 行为 | 适用场景 |
+|------|------|---------|
+| `formula`（默认） | 确定性权重轮询：静态权重 × 动态因子 × 质量因子 | 稳定运行、零额外开销 |
+| `model` | 调用外部路由模型服务做决策；失败按 `fallback` 处理（`formula` 降级 / `error` 直接 503） | 需要模型智能选 provider |
+| `hybrid` | 优先模型路由，失败自动降级 formula | 过渡期 / 试探性上线 |
+
+```yaml
+routing_strategy:
+  mode: hybrid  # formula | model | hybrid
+  model_router:
+    endpoint: "http://127.0.0.1:9090/v1/route"   # 外部路由模型服务
+    timeout_ms: 500
+    fallback: formula        # mode=model 时生效
+    cache_enabled: true      # 相同 query 在 TTL 内复用决策
+    cache_ttl_seconds: 300
+```
+
+**缓存**：路由决策按 query 哈希缓存，相同请求在 TTL 内不再调用路由模型服务（零重复开销）。
+**切换**：改配置后 `kill -HUP $(cat gateway.pid)` 热加载，无需重启。
+
 ## 启动选项
 
 ```bash

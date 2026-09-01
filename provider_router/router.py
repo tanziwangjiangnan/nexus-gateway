@@ -9,7 +9,7 @@ import os
 import random
 import threading
 import time
-from typing import Callable
+from typing import Any, Callable, Optional
 
 
 @dataclasses.dataclass
@@ -174,5 +174,110 @@ class Router:
         row = conn.execute("SELECT provider FROM usage ORDER BY id DESC LIMIT 1").fetchone()
         conn.close()
         return row["provider"] if row else None
+
+
+def call_model_router(query: str, candidates: list, config: dict,
+                      session_id: str = None) -> Optional[str]:
+    """同步调用外部路由模型服务，返回选中的 provider 名称。
+
+    参数:
+        query: 用户发来的原始请求内容
+        candidates: 候选 provider 名称列表
+        config: model_router 配置段（endpoint/timeout_ms/fallback 等）
+        session_id: 可选，会话级上下文
+
+    返回:
+        provider 名称；若服务不可用、超时或返回无效结果，返回 None 表示需降级。
+    """
+    from .cache import get_cache
+
+    endpoint = (config or {}).get("endpoint") or ""
+    timeout_ms = int((config or {}).get("timeout_ms", 500))
+    cache_enabled = bool((config or {}).get("cache_enabled", True))
+    ttl_seconds = int((config or {}).get("cache_ttl_seconds", 300))
+
+    if not endpoint:
+        return None
+
+    # 缓存命中：相同 query 在 TTL 内复用路由结果
+    if cache_enabled:
+        cached = get_cache().get(query)
+        if cached is not None:
+            return cached
+
+    payload = {
+        "query": query,
+        "candidates": candidates,
+        "context": {"session_id": session_id or "unknown", "task_type": "general"},
+    }
+
+    try:
+        # 延迟导入 urllib，避免引入 httpx 依赖（provider_router 保持零外部依赖）
+        import urllib.request
+        import urllib.error
+
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=timeout_ms / 1000.0)
+        result = json.loads(resp.read().decode())
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
+        return None
+    except Exception:
+        return None
+
+    selected = result.get("selected") if isinstance(result, dict) else None
+    if selected in candidates:
+        if cache_enabled:
+            get_cache().set(query, selected)
+        return selected
+    return None
+
+
+def select_provider_by_strategy(providers: list, state: RouterState, cfg: dict,
+                                model: str = None, query: str = None,
+                                session_id: str = None) -> Optional[dict]:
+    """按路由策略选择 provider（v2.8 模型路由）。
+
+    模式:
+        formula — 现有确定性权重逻辑（静态权重 × 动态因子）
+        model   — 调用外部路由模型服务；失败时按 fallback 配置降级
+        hybrid  — 优先模型路由，失败时回退 formula
+
+    返回:
+        provider 配置 dict；model 模式下且 fallback=error 时返回 None。
+    """
+    routing_cfg = cfg.get("routing_strategy", {}) or {}
+    mode = routing_cfg.get("mode", "formula")
+    model_router_cfg = routing_cfg.get("model_router", {}) or {}
+
+    # 模型路由模式：model / hybrid 且提供了 query
+    if mode in ("model", "hybrid") and query:
+        candidates = [p["name"] for p in providers
+                      if p["name"] not in state.disabled_providers]
+        if model:
+            model_lower = model.lower()
+            candidates = [p["name"] for p in providers
+                          if p["name"] not in state.disabled_providers
+                          and model_lower in [m.lower() for m in p.get("models", [])]]
+        if not candidates:
+            return None
+        selected = call_model_router(query, candidates, model_router_cfg, session_id)
+        if selected:
+            for p in providers:
+                if p["name"] == selected and p["name"] not in state.disabled_providers:
+                    return p
+            return None
+
+        if mode == "model":
+            if model_router_cfg.get("fallback", "formula") == "error":
+                return None
+            # fallback == "formula" → 落到下方公式逻辑
+
+    # formula 模式或 hybrid 降级：确定性权重
+    return Router.select_provider(providers, state, model=model)
 
 

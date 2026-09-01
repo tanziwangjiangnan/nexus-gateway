@@ -11,7 +11,7 @@
 #   → 切换时先停一个，再起另一个，零上下文丢失
 
 [Unit]
-Description=模型池网关 v3.10 — Docker 容器化部署
+Description=模型池网关 v3.11 — Docker 容器化部署
 After=docker.service
 Requires=docker.service
 
