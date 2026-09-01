@@ -319,6 +319,7 @@ def build_app(cfg, deps):
     select_pool_by_keywords = deps["select_pool_by_keywords"]
     select_provider_by_weight = deps["select_provider_by_weight"]
     select_provider_with_runner_up = deps["select_provider_with_runner_up"]
+    select_provider_by_strategy = deps.get("select_provider_by_strategy")
     check_rate_limit = deps["check_rate_limit"]
     _quality_factors = deps["quality_factors"]
     _benchmark_loaded = deps.get("benchmark_loaded", False)
@@ -584,9 +585,11 @@ def build_app(cfg, deps):
             pool_name = None
             pool_cfg = None
 
+        # ── 提取消息文本用于模型路由 / 关键词路由 ──
+        messages_text = json.dumps(messages, ensure_ascii=False)
+
         # 2. 关键词路由（仅当模型路由未命中时使用）
         if not pool_name:
-            messages_text = json.dumps(messages, ensure_ascii=False)
             kw_pool = select_pool_by_keywords(cfg, messages_text)
             if kw_pool:
                 pool_name = kw_pool
@@ -607,12 +610,30 @@ def build_app(cfg, deps):
             if not pool_cfg:
                 break
 
-            # 4. 按权重选 provider（同时选出第二名作为潜在检查者）
+            # 4. 按路由策略选 provider（v2.8 模型路由）
+            #    formula: 现有权重轮询（同时选出第二名作为潜在检查者）
+            #    model/hybrid: 先调用外部路由模型服务，失败时按配置降级
             # 用户自定义 key 时不限制模型名（用户用自己的 key 调任何 provider），
             # 否则只选有该模型的 provider
             model_filter = None if user_key else model
-            pv, runner_up, _ = select_provider_with_runner_up(
-                pool_cfg.get("providers", []), model=model_filter)
+            strategy_mode = (cfg.get("routing_strategy") or {}).get("mode", "formula")
+            strategy_pv = None
+            if select_provider_by_strategy and strategy_mode in ("model", "hybrid") and messages_text:
+                strategy_pv = select_provider_by_strategy(
+                    pool_cfg.get("providers", []), cfg, model=model_filter,
+                    query=messages_text, session_id=body.get("session_id"))
+                # model 模式 + fallback=error：模型路由失败直接 503，不走降级
+                if strategy_pv is None and strategy_mode == "model":
+                    fallback = (cfg.get("routing_strategy", {}).get("model_router", {}) or {}).get("fallback", "formula")
+                    if fallback == "error":
+                        last_error = "model router failed (fallback=error)"
+                        current_pool = None
+                        break
+            if strategy_pv:
+                pv, runner_up = strategy_pv, None
+            else:
+                pv, runner_up, _ = select_provider_with_runner_up(
+                    pool_cfg.get("providers", []), model=model_filter)
             if not pv:
                 last_error = f"pool '{current_pool}' all providers disabled"
                 current_pool = pool_cfg.get("fallback")

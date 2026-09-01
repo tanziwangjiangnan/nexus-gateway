@@ -6,12 +6,12 @@
 # 重建:   docker compose -f deploy/docker-compose.yaml up -d --build
 #
 # 前置条件:
-#   - 构建镜像: docker build -t nexus-gateway:v3.10 .
+#   - 构建镜像: docker build -t nexus-gateway:v3.11 .
 #   - 在 /root/.hermes/.env 中配置 provider 密钥
 
 services:
   nexus-gateway:
-    image: nexus-gateway:v3.10
+    image: nexus-gateway:v3.11
     container_name: nexus-gateway
     restart: unless-stopped
     ports:

@@ -1,5 +1,40 @@
 # Changelog
+## v3.11 (2026-09-01)
 
+### 新增：可插拔模型路由策略
+- 新增 provider_router/router.py 中 call_model_router() 和 select_provider_by_strategy() 两个函数
+- 新增 provider_router/cache.py — RouteCache 类，线程安全 TTL 缓存，默认 300s
+- 新增 provider_router/config.py 中 routing_strategy 配置段解析（含默认值填充）
+- 网关集成：gateway.py wrapper + app.py chat_completions 三模式入口
+  - formula — 原有确定性权重轮询（默认，零行为变化）
+  - model — 调用外部路由模型服务做决策，支持 fallback=error|formula
+  - hybrid — 优先模型路由，失败时降级 formula
+- 路由缓存：相同 query 在 TTL 内复用决策结果，零额外 Token 开销
+
+### 兼容
+- 默认 mode: formula，未配置 routing_strategy 段时行为完全不变
+- test_router_server.py 提供参考实现：用 scnet-tp 做路由决策模型
+- 路由决策模型选型说明：deepseek-v4-flash 是推理模型，输出全耗在 reasoning_content，不适合做路由决策；改用 scnet-tp（轻量非推理，约10 tokens/次）
+
+### 灵感来源
+- RL 强化学习路由策略学习笔记（4.1.2~4.3.3）：从固定权重轮询到模型自主决策的演进路径
+- 核心思路：路由本身是一个轻量决策问题，不需要高成本推理模型，一个非推理模型足以从候选列表中选择最优 provider
+- 缓存设计（TTL 路由缓存）来自"路由开销不应超过请求本身"的工程原则
+
+### 切换方式
+在 gateway.yaml 中设置：
+routing_strategy:
+  mode: hybrid  # formula | model | hybrid
+  model_router:
+    endpoint: http://127.0.0.1:9090/v1/route
+    timeout_ms: 500
+    fallback: formula
+    cache_enabled: true
+    cache_ttl_seconds: 300
+- mode: formula → 默认，纯权重轮询，无需任何额外配置
+- mode: model → 纯模型路由，路由服务不可用时返回 503（fallback=error）或降级 formula
+- mode: hybrid → 优先模型路由，失败自动降级 formula
+- 切换后 SIGHUP 热加载生效：kill -HUP $(cat gateway.pid)
 ## v3.10 (2026-08-29)
 
 ### 新增：离线基准评分（benchmark）
