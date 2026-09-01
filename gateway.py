@@ -63,7 +63,7 @@ import yaml
 import httpx
 
 # ── 组件包导入 ──
-from provider_router import Router, RouterState, CircuitBreakerMonitor
+from provider_router import Router, RouterState, CircuitBreakerMonitor, select_provider_by_strategy
 from fiber_tree import FiberTree, MemoryStorage
 from ops_gateway_core import ConfigLoader, get_db, init_registry
 from ops_gateway_core.fiber import FiberRuntime
@@ -315,6 +315,10 @@ def select_provider_with_runner_up(providers, model=None):
 def check_rate_limit(provider_name, max_rps):
     """滑动窗口限流，返回 True=通过 False=限流"""
     return Router.check_rate_limit(provider_name, max_rps, _router_state)
+
+def select_provider_by_strategy_wrapper(providers, cfg, model=None, query=None, session_id=None):
+    """按路由策略选择 provider（v2.8 模型路由）。"""
+    return select_provider_by_strategy(providers, _router_state, cfg, model=model, query=query, session_id=session_id)
 # ── FastAPI 应用 ──
 def create_app(cfg):
     """构建 FastAPI 应用实例（薄封装，委托给 hermes_api.build_app）。"""
@@ -344,6 +348,7 @@ def create_app(cfg):
         "select_pool_by_keywords": select_pool_by_keywords,
         "select_provider_by_weight": select_provider_by_weight,
         "select_provider_with_runner_up": select_provider_with_runner_up,
+        "select_provider_by_strategy": select_provider_by_strategy_wrapper,
         "check_rate_limit": check_rate_limit,
         "quality_factors": _quality_factors,
         "user_factors": _user_factors,
