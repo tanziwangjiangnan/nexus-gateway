@@ -33,12 +33,13 @@
 
 | 包 | PyPI 名 | 版本 | 依赖 |
 |---|---------|------|------|
-| `provider_router/` | `ops-provider-router` | 2.9.0 | — |
+| `provider_router/` | `ops-provider-router` | 2.10.0 | — |
 | `fiber_tree/` | `ops-fiber-tree` | 2.9.0 | — |
 | `hermes_fiber/` | `ops-fiber` | 3.1.0 | — |
 | `hermes_cfg/` | `ops-cfg` | 3.0.0 | `ops-provider-router`, PyYAML |
 | `hermes_api/` | `ops-api` | 3.2.0 | `ops-provider-router`, `ops-cfg`, `ops-fiber`, FastAPI, uvicorn |
 | `hermes_ops/` | `ops-ops` | 3.3.0 | `ops-cfg`, PyYAML |
+| `ops-gateway-core/` | `ops-gateway-core` | 0.4.0 | `ops-provider-router`, `ops-fiber-tree`, `ops-fiber`, `ops-cfg`, `ops-api`, `ops-ops`, FastAPI, uvicorn, httpx, prometheus-client, PyYAML |
 
 ## 快速开始
 
