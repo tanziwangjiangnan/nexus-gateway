@@ -9,6 +9,31 @@ gateway_key: ${GATEWAY_KEY}
 host: 0.0.0.0
 port: 8646
 
+# ── 前置检查层路径规则（v3.13）──
+# 由复杂度+确定度规则表决定路径，不由模型决定
+routing_rules:
+  trivial:
+    action: direct_return
+    message: "您好，请问有什么可以帮您？"
+  simple_high_confidence:
+    pool: pool_a
+    validation: none
+  simple_low_confidence:
+    pool: pool_b
+    validation: light
+  simple:
+    pool: pool_a
+    validation: none
+  medium:
+    pool: pool_b
+    supervisor: true
+  complex:
+    pool: pool_c
+    supervisor: true
+  very_complex:
+    pool: pool_c
+    supervisor: true
+
 pools:
   pool_a:
     description: 日常对话池

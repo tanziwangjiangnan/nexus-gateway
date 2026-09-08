@@ -572,6 +572,7 @@ def build_app(cfg, deps):
         stream = body.get("stream", False)
         # 用户自定义 key（从聊天页面带入），覆盖 provider 配置的 key
         user_key = body.pop("api_key", None)
+        explicit_model = "model" in body  # 用户是否显式指定模型（前置检查仅拦截未指定的）
         kwargs = {k: v for k, v in body.items() if k not in ("model", "messages", "stream")}
 
         # 1. 模型名精确匹配（大小写不敏感，优先级最高）
@@ -588,6 +589,45 @@ def build_app(cfg, deps):
         # ── 提取消息文本用于模型路由 / 关键词路由 ──
         messages_text = json.dumps(messages, ensure_ascii=False)
 
+        # ── 前置检查层：复杂度评估 + Token 概率检测（并行，不阻塞主流程） ──
+        _pre_check = {}
+        try:
+            from provider_router.assessor import complexity_assess, token_confidence, select_path
+            # 取最后一条用户消息作分析文本
+            probe_text = ""
+            for m in reversed(messages):
+                if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
+                    probe_text = m["content"]
+                    break
+            if probe_text:
+                # 分支1: 复杂度评估（纯规则，<5ms）— 永不抛异常
+                _pre_check["complexity"] = complexity_assess(probe_text)
+                # 分支2: Token 概率检测（网络调用，需独立保护）
+                # 1s 硬超时 + httpx 超时，确保前置检查不拖慢主流程
+                _pool_a_cfg = cfg.get("pools", {}).get("pool_a", {})
+                _first_pv = (_pool_a_cfg.get("providers") or [None])[0]
+                if _first_pv:
+                    try:
+                        _pc = cfg.get("providers", {}).get(_first_pv["name"], {})
+                        _api = _pc.get("api", "")
+                        _key = (user_key or Router.resolve_env_key(_pc.get("api_key", "")))
+                        if _first_pv.get("models"):
+                            _pre_check["confidence"] = await asyncio.wait_for(
+                                token_confidence(probe_text, _api, _key, _first_pv["models"][0], timeout_ms=1000),
+                                timeout=1.2)
+                    except Exception:
+                        pass  # Token 概率检测失败不影响主流程和路径选择
+                # 路径选择（纯本地规则，<5ms）
+                _routing_rules = cfg.get("routing_rules", {})
+                _rule = select_path(_pre_check, _routing_rules)
+                _pre_check["rule"] = _rule
+                print(f"🔍 前置检查: level={_pre_check.get('complexity',{}).get('level')}, "
+                      f"confidence={_pre_check.get('confidence',{}).get('confidence')}, "
+                      f"rule_pool={_rule.get('pool','-')}")
+        except Exception as _pe:
+            # 前置检查不应影响主流程，出错静默降级
+            pass
+
         # 2. 关键词路由（仅当模型路由未命中时使用）
         if not pool_name:
             kw_pool = select_pool_by_keywords(cfg, messages_text)
@@ -598,7 +638,44 @@ def build_app(cfg, deps):
         if not pool_name:
             pool_name = cfg.get("routing", {}).get("default_pool", "pool_a")
 
-        # 3. 走故障转移链
+        # 3b. 前置检查路径控制（仅当用户未显式指定模型时生效）
+        #     规则表决定路径，不由模型决定；trivial 直接返回不调模型
+        _path_rule = _pre_check.get("rule") if _pre_check else None
+        if _path_rule and pool_name and not explicit_model and not user_key:
+            _rule_pool = _path_rule.get("pool")
+            if _path_rule.get("action") == "direct_return":
+                _msg = _path_rule.get("message") or "您好，请问有什么可以帮您？"
+                app.state.req_counter.labels(pool="direct", provider="none", status="200").inc()
+                return Response(
+                    content=json.dumps({
+                        "id": f"chatcmpl-precheck-{int(t0*1000)}",
+                        "object": "chat.completion",
+                        "created": int(t0),
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": _msg},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    }),
+                    status_code=200, media_type="application/json")
+            if _rule_pool and _rule_pool != "fiber_split":
+                # 规则指定的池在配置中存在且与关键词路由冲突时，规则优先
+                _rule_pool_cfg = cfg.get("pools", {}).get(_rule_pool)
+                if _rule_pool_cfg and any(p.get("name") not in _disabled_providers
+                                          for p in _rule_pool_cfg.get("providers", [])):
+                    pool_name = _rule_pool
+                    # model 需属于该池，否则模型过滤会排除所有 provider
+                    # → 规则选池时自动指定该池第一个可用 provider 的模型
+                    if not any(model.lower() in [m.lower() for m in pv.get("models", [])]
+                               for pv in _rule_pool_cfg.get("providers", [])):
+                        for _pv in _rule_pool_cfg.get("providers", []):
+                            if _pv.get("name") not in _disabled_providers and _pv.get("models"):
+                                model = _pv["models"][0]
+                                break
+
+        # 4. 走故障转移链
         tried_pools = set()
         current_pool = pool_name
         last_error = "no available provider"
