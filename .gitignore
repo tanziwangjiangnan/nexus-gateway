@@ -35,3 +35,5 @@ tmp/
 
 # OpenHands agent memory (local only)
 .openhands/
+gateway.db-wal
+gateway.db-shm
