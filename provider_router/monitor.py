@@ -201,8 +201,36 @@ class CircuitBreakerMonitor:
                     conn.execute(
                         "UPDATE registry SET status=?, updated_at=datetime('now') WHERE provider=? AND status != ?",
                         ("healthy" if ok else "down", name, "healthy" if ok else "down"))
+                except urllib.error.HTTPError as e:
+                    err_str = str(e)
+                    # 401/403 = 鉴权或配置错误，不熔断（上游可达，只是 key 有问题）
+                    if e.code in (401, 403):
+                        if not is_disabled:
+                            print(f"探测告警: {name} 鉴权错误 ({e.code}) -> registry=unhealthy, 但不熔断")
+                        conn.execute(
+                            "INSERT INTO health_log (model, pool, provider, ok, latency_ms, error) VALUES (?,?,?,?,?,?)",
+                            ("probe", "unknown", name, 0, 0, err_str[:200]))
+                        conn.execute(
+                            "UPDATE registry SET status='unhealthy', updated_at=datetime('now') WHERE provider=? AND status != 'healthy'",
+                            (name,))
+                    else:
+                        # 其他 HTTP 错误（5xx 等）或连接失败 → 熔断
+                        if not is_disabled:
+                            with self.lock:
+                                self.disabled_providers.add(name)
+                            if self.undo_register:
+                                self.undo_register(f"主动探测熔断 {name} ({err_str[:50]})",
+                                                   lambda n=name: self.disabled_providers.discard(n))
+                            print(f"探测熔断: {name} 不可达 (HTTP {e.code}) -> 已禁用 ({err_str[:60]})")
+                        conn.execute(
+                            "INSERT INTO health_log (model, pool, provider, ok, latency_ms, error) VALUES (?,?,?,?,?,?)",
+                            ("probe", "unknown", name, 0, 0, err_str[:200]))
+                        conn.execute(
+                            "UPDATE registry SET status='down', updated_at=datetime('now') WHERE provider=? AND status != 'down'",
+                            (name,))
                 except Exception as e:
                     err_str = str(e)
+                    # 连接失败/超时/其他异常 → 熔断
                     if not is_disabled:
                         with self.lock:
                             self.disabled_providers.add(name)
