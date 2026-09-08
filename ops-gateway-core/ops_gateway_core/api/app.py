@@ -821,11 +821,23 @@ def build_app(cfg, deps):
             providers = []
             for pv in pool_cfg.get("providers", []):
                 pc = cfg.get("providers", {}).get(pv["name"], {})
+                # 从 registry 表读取真实健康状态（由熔断器主动探测更新）
+                try:
+                    conn = get_db()
+                    row = conn.execute(
+                        "SELECT status FROM registry WHERE provider = ? ORDER BY updated_at DESC LIMIT 1",
+                        (pv["name"],)
+                    ).fetchone()
+                    reg_status = row[0] if row else "unknown"
+                    conn.close()
+                except Exception:
+                    reg_status = "unknown"
                 providers.append({
                     "name": pv["name"],
                     "weight": pv.get("weight", 1),
                     "models": pv.get("models", []),
                     "disabled": pv["name"] in _disabled_providers,
+                    "status": reg_status,
                     "max_rps": pc.get("max_rps", 0),
                     "api": pc.get("api", ""),
                 })

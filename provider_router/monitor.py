@@ -4,8 +4,11 @@
 动态权重：base_weight × (1 - err_rate)，保底 0.1。
 质量/用户因子公式可通过回调注入，默认使用线性映射。
 """
+import json
 import threading
 import time
+import urllib.error
+import urllib.request
 from typing import Callable
 
 
@@ -123,7 +126,7 @@ class CircuitBreakerMonitor:
                 feedbacks = [r[0] for r in urows]
                 self.user_factors[provider] = self.user_factor_fn(feedbacks)
 
-        conn.close()
+        # ── 熔断/恢复/动态权重：基于 5 分钟滑动窗口错误率 ──
         for r in rows:
             name = r["provider"]
             total = r["total"]
@@ -156,3 +159,62 @@ class CircuitBreakerMonitor:
                         base = pv.get("weight", 1.0)
                         break
             self.dynamic_weights[name] = max(base * (1.0 - err_rate), 0.1)
+
+        # ── 主动探测：usage 无流量的 provider 做一次 HTTP 连通性探测 ──
+        # 打通 probe/registry/熔断三孤岛：探测失败 -> 熔断禁用 + registry=down
+        active = {r["provider"] for r in rows}
+        for pc in cfg.get("pools", {}).values():
+            for pv in pc.get("providers", []):
+                name = pv["name"]
+                if name in active:
+                    continue
+                pc_raw = cfg.get("providers", {}).get(name, {})
+                api = pc_raw.get("api", "")
+                key = pc_raw.get("api_key", "")
+                if not api or not key:
+                    continue
+                is_disabled = name in self.disabled_providers
+                try:
+                    models = pv.get("models", [])
+                    probe_model = models[0] if models else "probe"
+                    body = json.dumps({"model": probe_model,
+                                       "messages": [{"role": "user", "content": "ping"}],
+                                       "max_tokens": 1}).encode()
+                    t0 = time.time()
+                    req = urllib.request.Request(
+                        f"{api.rstrip('/')}/chat/completions",
+                        data=body,
+                        headers={"Content-Type": "application/json",
+                                 "Authorization": f"Bearer {key}"},
+                        method="POST",
+                    )
+                    resp = urllib.request.urlopen(req, timeout=30)
+                    latency = int((time.time() - t0) * 1000)
+                    ok = resp.status == 200
+                    if ok and is_disabled:
+                        with self.lock:
+                            self.disabled_providers.discard(name)
+                        print(f"探测恢复: {name} 可达 -> 已启用")
+                    conn.execute(
+                        "INSERT INTO health_log (model, pool, provider, ok, latency_ms, error) VALUES (?,?,?,?,?,?)",
+                        (probe_model, "unknown", name, 1 if ok else 0, latency, ""))
+                    conn.execute(
+                        "UPDATE registry SET status=?, updated_at=datetime('now') WHERE provider=? AND status != ?",
+                        ("healthy" if ok else "down", name, "healthy" if ok else "down"))
+                except Exception as e:
+                    err_str = str(e)
+                    if not is_disabled:
+                        with self.lock:
+                            self.disabled_providers.add(name)
+                        if self.undo_register:
+                            self.undo_register(f"主动探测熔断 {name} ({err_str[:50]})",
+                                               lambda n=name: self.disabled_providers.discard(n))
+                        print(f"探测熔断: {name} 不可达 -> 已禁用 ({err_str[:60]})")
+                    conn.execute(
+                        "INSERT INTO health_log (model, pool, provider, ok, latency_ms, error) VALUES (?,?,?,?,?,?)",
+                        ("probe", "unknown", name, 0, 0, err_str[:200]))
+                    conn.execute(
+                        "UPDATE registry SET status='down', updated_at=datetime('now') WHERE provider=? AND status != 'down'",
+                        (name,))
+        conn.commit()
+        conn.close()
