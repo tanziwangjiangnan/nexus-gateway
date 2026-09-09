@@ -589,44 +589,46 @@ def build_app(cfg, deps):
         # ── 提取消息文本用于模型路由 / 关键词路由 ──
         messages_text = json.dumps(messages, ensure_ascii=False)
 
-        # ── 前置检查层：复杂度评估 + Token 概率检测（并行，不阻塞主流程） ──
+        # ── 前置检查层：复杂度评估 + Token 概率检测 ──
+        # 显式指定模型时跳过（用户知道自己要什么），减少白打网络请求
         _pre_check = {}
-        try:
-            from provider_router.assessor import complexity_assess, token_confidence, select_path
-            # 取最后一条用户消息作分析文本
-            probe_text = ""
-            for m in reversed(messages):
-                if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
-                    probe_text = m["content"]
-                    break
-            if probe_text:
-                # 分支1: 复杂度评估（纯规则，<5ms）— 永不抛异常
-                _pre_check["complexity"] = complexity_assess(probe_text)
-                # 分支2: Token 概率检测（网络调用，需独立保护）
-                # 1s 硬超时 + httpx 超时，确保前置检查不拖慢主流程
-                _pool_a_cfg = cfg.get("pools", {}).get("pool_a", {})
-                _first_pv = (_pool_a_cfg.get("providers") or [None])[0]
-                if _first_pv:
-                    try:
-                        _pc = cfg.get("providers", {}).get(_first_pv["name"], {})
-                        _api = _pc.get("api", "")
-                        _key = (user_key or Router.resolve_env_key(_pc.get("api_key", "")))
-                        if _first_pv.get("models"):
-                            _pre_check["confidence"] = await asyncio.wait_for(
-                                token_confidence(probe_text, _api, _key, _first_pv["models"][0], timeout_ms=1000),
-                                timeout=1.2)
-                    except Exception:
-                        pass  # Token 概率检测失败不影响主流程和路径选择
-                # 路径选择（纯本地规则，<5ms）
-                _routing_rules = cfg.get("routing_rules", {})
-                _rule = select_path(_pre_check, _routing_rules)
-                _pre_check["rule"] = _rule
-                print(f"🔍 前置检查: level={_pre_check.get('complexity',{}).get('level')}, "
-                      f"confidence={_pre_check.get('confidence',{}).get('confidence')}, "
-                      f"rule_pool={_rule.get('pool','-')}")
-        except Exception as _pe:
-            # 前置检查不应影响主流程，出错静默降级
-            pass
+        if not explicit_model:
+            try:
+                from provider_router.assessor import complexity_assess, token_confidence, select_path
+                # 取最后一条用户消息作分析文本
+                probe_text = ""
+                for m in reversed(messages):
+                    if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
+                        probe_text = m["content"]
+                        break
+                if probe_text:
+                    # 分支1: 复杂度评估（纯规则，<5ms）— 永不抛异常
+                    _pre_check["complexity"] = complexity_assess(probe_text)
+                    # 分支2: Token 概率检测（网络调用，需独立保护）
+                    # 1s 硬超时 + httpx 超时，确保前置检查不拖慢主流程
+                    _pool_a_cfg = cfg.get("pools", {}).get("pool_a", {})
+                    _first_pv = (_pool_a_cfg.get("providers") or [None])[0]
+                    if _first_pv:
+                        try:
+                            _pc = cfg.get("providers", {}).get(_first_pv["name"], {})
+                            _api = _pc.get("api", "")
+                            _key = (user_key or Router.resolve_env_key(_pc.get("api_key", "")))
+                            if _first_pv.get("models"):
+                                _pre_check["confidence"] = await asyncio.wait_for(
+                                    token_confidence(probe_text, _api, _key, _first_pv["models"][0], timeout_ms=1000),
+                                    timeout=1.2)
+                        except Exception:
+                            pass  # Token 概率检测失败不影响主流程和路径选择
+                    # 路径选择（纯本地规则，<5ms）
+                    _routing_rules = cfg.get("routing_rules", {})
+                    _rule = select_path(_pre_check, _routing_rules)
+                    _pre_check["rule"] = _rule
+                    print(f"🔍 前置检查: level={_pre_check.get('complexity',{}).get('level')}, "
+                          f"confidence={_pre_check.get('confidence',{}).get('confidence')}, "
+                          f"rule_pool={_rule.get('pool','-')}")
+            except Exception as _pe:
+                # 前置检查不应影响主流程，出错静默降级
+                pass
 
         # 2. 关键词路由（仅当模型路由未命中时使用）
         if not pool_name:
