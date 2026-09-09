@@ -47,13 +47,24 @@ pools:
         models: [mimo-v2.5-pro]
         capabilities: [chat]
   pool_b:
-    description: 增强/需审批池
+    description: 增强/需审批池 (QFG New)
     fallback: pool_c
     providers:
-      - name: qfg-codex
+      - name: qfg-new
         weight: 3
-        models: [codex-v1]
-        capabilities: [chat, code]
+        models:
+          - grok-4.3
+          - gpt-5.4
+          - grok-imagine-image-2.0
+          - grok-imagine-image
+          - grok-imagine-image-quality
+          - gpt-image-1
+          - gpt-image-1.5
+          - gpt-image-2
+          - gemini-3.1-flash-image
+          - grok-imagine-video
+          - grok-imagine-video-1.5-preview
+        capabilities: [chat, code, image]
   pool_c:
     description: 快速验证池
     providers:
@@ -67,9 +78,9 @@ providers:
     api: https://api.deepseek.com/v1
     api_key: ${DEEPSEEK_API_KEY}
     max_rps: 50
-  qfg-codex:
-    api: https://api.qfg.cn/v1
-    api_key: ${QFG_GPT_KEY}
+  qfg-new:
+    api: https://qfgapi.com/v1
+    api_key: ${QFG_NEW_KEY}
     max_rps: 30
   scnet-tp:
     api: https://api.scnet.cn/api/llm/v1
