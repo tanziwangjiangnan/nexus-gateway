@@ -592,15 +592,17 @@ def build_app(cfg, deps):
         # ── 前置检查层：复杂度评估 + Token 概率检测 ──
         # 显式指定模型时跳过（用户知道自己要什么），减少白打网络请求
         _pre_check = {}
+
+        # 取最后一条用户消息作分析文本（能力标签匹配与前置检查共享）
+        probe_text = ""
+        for m in reversed(messages):
+            if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
+                probe_text = m["content"]
+                break
+
         if not explicit_model:
             try:
                 from provider_router.assessor import complexity_assess, token_confidence, select_path
-                # 取最后一条用户消息作分析文本
-                probe_text = ""
-                for m in reversed(messages):
-                    if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
-                        probe_text = m["content"]
-                        break
                 if probe_text:
                     # 分支1: 复杂度评估（纯规则，<5ms）— 永不抛异常
                     _pre_check["complexity"] = complexity_assess(probe_text)
@@ -683,6 +685,18 @@ def build_app(cfg, deps):
         last_error = "no available provider"
         used_provider = ""
 
+        # 能力标签匹配：提取一次，复用多池迭代
+        _query_caps = None
+        _threshold = None
+        if not user_key and not explicit_model and probe_text:
+            from provider_router.assessor import extract_query_capabilities
+            _query_caps = extract_query_capabilities(probe_text, cfg)
+            # 全 0 向量 = 无明确能力需求 → 用 None 跳过能力过滤
+            if not any(v > 0 for v in _query_caps.values()):
+                _query_caps = None
+            else:
+                _threshold = cfg.get("capability_threshold", 0.3)
+
         while current_pool and current_pool not in tried_pools:
             tried_pools.add(current_pool)
             pool_cfg = cfg.get("pools", {}).get(current_pool)
@@ -700,7 +714,8 @@ def build_app(cfg, deps):
             if select_provider_by_strategy and strategy_mode in ("model", "hybrid") and messages_text:
                 strategy_pv = select_provider_by_strategy(
                     pool_cfg.get("providers", []), cfg, model=model_filter,
-                    query=messages_text, session_id=body.get("session_id"))
+                    query=messages_text, session_id=body.get("session_id"),
+                    query_caps=_query_caps, capability_threshold=_threshold)
                 # model 模式 + fallback=error：模型路由失败直接 503，不走降级
                 if strategy_pv is None and strategy_mode == "model":
                     fallback = (cfg.get("routing_strategy", {}).get("model_router", {}) or {}).get("fallback", "formula")
@@ -712,7 +727,8 @@ def build_app(cfg, deps):
                 pv, runner_up = strategy_pv, None
             else:
                 pv, runner_up, _ = select_provider_with_runner_up(
-                    pool_cfg.get("providers", []), model=model_filter)
+                    pool_cfg.get("providers", []), model=model_filter,
+                    query_caps=_query_caps, capability_threshold=_threshold)
             if not pv:
                 last_error = f"pool '{current_pool}' all providers disabled"
                 current_pool = pool_cfg.get("fallback")

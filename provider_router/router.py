@@ -50,31 +50,48 @@ class Router:
 
     @staticmethod
     def select_provider(providers: list, state: RouterState, model: str = None,
-                        weight_fn: Callable = None):
+                        weight_fn: Callable = None, query_caps: dict = None,
+                        capability_threshold: float = None):
         """按权重随机选一个 provider，跳过禁用的；
         若指定 model 则只选有该模型的（大小写不敏感）。
         weight_fn 可选，签名 (provider_cfg, state) → float，用于自定义权重计算。
         默认权重 = 动态权重 × 质量因子 × 用户因子，保底 0.1。
+        query_caps — 能力需求向量，不为 None 时启用能力标签过滤+匹配因子。
+        capability_threshold — 能力过滤阈值，默认 0.3。
         返回 provider 配置 dict 或 None。
         """
-        picked, _ = Router._select_weighted(providers, state, model, weight_fn)
+        picked, _ = Router._select_weighted(providers, state, model, weight_fn,
+                                            query_caps, capability_threshold)
         return picked
 
     @staticmethod
     def select_provider_with_runner_up(providers: list, state: RouterState,
-                                        model: str = None, weight_fn: Callable = None):
+                                        model: str = None, weight_fn: Callable = None,
+                                        query_caps: dict = None,
+                                        capability_threshold: float = None):
         """按权重选一个 provider，同时返回第二名（候选池中权重次高者）。
 
         第二名作为"检查者"：主请求完成后，第二名会收到主请求的问题+回答，
         并打一个质量分（0-100）。返回 (selected, runner_up, all_weights)。
 
         若候选不足 2 个，runner_up 为 None。
+        query_caps — 能力需求向量，不为 None 时启用能力标签过滤+匹配因子。
         """
         candidates = [p for p in providers if p["name"] not in state.disabled_providers]
         if model:
             model_lower = model.lower()
             candidates = [p for p in candidates
                           if model_lower in [m.lower() for m in p.get("models", [])]]
+        # 能力标签过滤：query_caps 不为 None 时执行
+        if query_caps is not None:
+            from provider_router.assessor import filter_providers_by_capability
+            if capability_threshold is None:
+                capability_threshold = 0.3
+            filtered = filter_providers_by_capability(candidates, query_caps, capability_threshold)
+            cap_scores = {p["name"]: s for p, s in filtered}
+            candidates = [p for p, _ in filtered]
+        else:
+            cap_scores = {}
         if not candidates:
             return None, None, {}
         # 计算所有候选的权重
@@ -86,7 +103,8 @@ class Router:
                 w = state.dynamic_weights.get(p["name"]) or p.get("weight", 1)
                 qf = state.quality_factors.get(p["name"], 1.0)
                 uf = state.user_factors.get(p["name"], 1.0)
-                w = w * qf * uf
+                cf = cap_scores.get(p["name"], 1.0)  # 能力匹配因子
+                w = w * qf * uf * cf
                 w = max(w, 0.1)
             weights.append(w)
         # 轮盘赌选第一名
@@ -116,13 +134,27 @@ class Router:
         return picked, runner_up, all_weights
 
     @staticmethod
-    def _select_weighted(providers, state, model=None, weight_fn=None):
-        """内部：轮盘赌选一个，返回 (provider, weights_list)。"""
+    def _select_weighted(providers, state, model=None, weight_fn=None,
+                         query_caps=None, capability_threshold=None):
+        """内部：轮盘赌选一个，返回 (provider, weights_list)。
+
+        新增 query_caps / capability_threshold — 能力标签过滤，参见 select_provider_with_runner_up。
+        """
         candidates = [p for p in providers if p["name"] not in state.disabled_providers]
         if model:
             model_lower = model.lower()
             candidates = [p for p in candidates
                           if model_lower in [m.lower() for m in p.get("models", [])]]
+        # 能力标签过滤
+        if query_caps is not None:
+            from provider_router.assessor import filter_providers_by_capability
+            if capability_threshold is None:
+                capability_threshold = 0.3
+            filtered = filter_providers_by_capability(candidates, query_caps, capability_threshold)
+            cap_scores = {p["name"]: s for p, s in filtered}
+            candidates = [p for p, _ in filtered]
+        else:
+            cap_scores = {}
         if not candidates:
             return None, []
         weights = []
@@ -133,7 +165,8 @@ class Router:
                 w = state.dynamic_weights.get(p["name"]) or p.get("weight", 1)
                 qf = state.quality_factors.get(p["name"], 1.0)
                 uf = state.user_factors.get(p["name"], 1.0)
-                w = w * qf * uf
+                cf = cap_scores.get(p["name"], 1.0)
+                w = w * qf * uf * cf
                 w = max(w, 0.1)
             weights.append(w)
         total = sum(weights)
@@ -239,7 +272,9 @@ def call_model_router(query: str, candidates: list, config: dict,
 
 def select_provider_by_strategy(providers: list, state: RouterState, cfg: dict,
                                 model: str = None, query: str = None,
-                                session_id: str = None) -> Optional[dict]:
+                                session_id: str = None,
+                                query_caps: dict = None,
+                                capability_threshold: float = None) -> Optional[dict]:
     """按路由策略选择 provider（v2.8 模型路由）。
 
     模式:
@@ -249,6 +284,7 @@ def select_provider_by_strategy(providers: list, state: RouterState, cfg: dict,
 
     返回:
         provider 配置 dict；model 模式下且 fallback=error 时返回 None。
+    query_caps — 能力需求向量，不为 None 时 formula/hybrid 降级启用能力过滤。
     """
     routing_cfg = cfg.get("routing_strategy", {}) or {}
     mode = routing_cfg.get("mode", "formula")
@@ -278,6 +314,8 @@ def select_provider_by_strategy(providers: list, state: RouterState, cfg: dict,
             # fallback == "formula" → 落到下方公式逻辑
 
     # formula 模式或 hybrid 降级：确定性权重
-    return Router.select_provider(providers, state, model=model)
+    return Router.select_provider(providers, state, model=model,
+                                  query_caps=query_caps,
+                                  capability_threshold=capability_threshold)
 
 

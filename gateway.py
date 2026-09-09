@@ -308,17 +308,24 @@ def select_provider_by_weight(providers, model=None):
     """按权重随机选一个 provider，跳过禁用的；若指定 model 则只选有该模型的（大小写不敏感）"""
     return Router.select_provider(providers, _router_state, model=model)
 
-def select_provider_with_runner_up(providers, model=None):
-    """按权重选 provider，同时返回第二名（检查者）。返回 (selected, runner_up, weights)"""
-    return Router.select_provider_with_runner_up(providers, _router_state, model=model)
+def select_provider_with_runner_up(providers, model=None, query_caps=None, capability_threshold=None):
+    """按权重选 provider，同时返回第二名（检查者）。返回 (selected, runner_up, weights)
+    query_caps — 能力需求向量，不为 None 时启用能力标签过滤+匹配因子。
+    """
+    return Router.select_provider_with_runner_up(
+        providers, _router_state, model=model,
+        query_caps=query_caps, capability_threshold=capability_threshold)
 
 def check_rate_limit(provider_name, max_rps):
     """滑动窗口限流，返回 True=通过 False=限流"""
     return Router.check_rate_limit(provider_name, max_rps, _router_state)
 
-def select_provider_by_strategy_wrapper(providers, cfg, model=None, query=None, session_id=None):
+def select_provider_by_strategy_wrapper(providers, cfg, model=None, query=None, session_id=None,
+                                        query_caps=None, capability_threshold=None):
     """按路由策略选择 provider（v2.8 模型路由）。"""
-    return select_provider_by_strategy(providers, _router_state, cfg, model=model, query=query, session_id=session_id)
+    return select_provider_by_strategy(
+        providers, _router_state, cfg, model=model, query=query, session_id=session_id,
+        query_caps=query_caps, capability_threshold=capability_threshold)
 # ── FastAPI 应用 ──
 def create_app(cfg):
     """构建 FastAPI 应用实例（薄封装，委托给 hermes_api.build_app）。"""
