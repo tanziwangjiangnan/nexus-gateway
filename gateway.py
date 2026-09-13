@@ -122,14 +122,18 @@ def reload_config():
     4. _rate_limit_buckets 不清（滑动窗口，自动过期）
     """
     global _config, _disabled_providers
-    # [修复 2026-09-13] ConfigLoader.reload() 已对同一个 dict 对象做原地 clear+update，
-    # 此处若再 clear+update，因 new_cfg is _config（同一对象），
-    # 等于"清空后拿清空了的自己更新自己" → 配置变 {} → 鉴权 cfg['gateway_key'] KeyError
-    # → SIGHUP 之后所有请求 500。改为：先快照旧配置供 diff，再只依赖 loader 的原地更新。
-    old_cfg = dict(_config) if _config else {}
+    # [修复 2026-09-13] 原实现把配置清空成 {}：ConfigLoader.reload() 已对同一个 dict
+    # 对象做过 clear+update，此处再 clear+update 时 new_cfg is _config（同一对象），
+    # 等于清空后拿清空了的自己更新自己 → cfg['gateway_key'] KeyError → SIGHUP 后全站 500。
+    # 现在分两条路径：首次加载取回 loader 的 dict；热加载只依赖 loader 的原地更新。
+    if not _config:
+        _config = _config_loader.reload()
+        _disabled_providers.clear()
+        undo_clear("配置重载")
+        return _config
+    old_cfg = dict(_config)
     new_cfg = _config_loader.reload()
-    if old_cfg:
-        check_deps_on_diff(old_cfg, new_cfg, BASE, label="配置热加载")
+    check_deps_on_diff(old_cfg, new_cfg, BASE, label="配置热加载")
     _disabled_providers.clear()
     undo_clear("配置重载")
     return _config
