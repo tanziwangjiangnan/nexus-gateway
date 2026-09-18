@@ -266,3 +266,31 @@ def provider_status_summary(conn, cfg: dict = None) -> dict:
         "count": len(rows),
         "providers": [dict(r) for r in rows],
     }
+
+
+# ── 组合操作（给 HTTP 层用的薄接口，2026-09-18 从 app.py 下沉）──
+
+def prepare_candidates(conn, providers: list, budget: str, cfg: dict = None) -> tuple:
+    """冷却复活 + 候选过滤，一次连接内完成。
+
+    返回 (allowed, blocked)；blocked 为 [(provider, reason)] 便于调用方打日志。
+    副作用：会就地复活冷却到期的 exhausted 记录（recover_due）。
+    为什么放这里：这是「额度」这个关注点的完整语义，不该散在 HTTP 层（见 docs/模块约定.md）。
+    """
+    recover_due(conn)
+    statuses = get_statuses(conn, [p["name"] for p in providers])
+    return filter_candidates(providers, statuses, budget, cfg)
+
+
+def record_error_if_exhausted(conn, provider: str, http_status: int, body: str,
+                              cfg: dict = None) -> tuple:
+    """分类一次失败响应；只在「额度耗尽」时落库。
+
+    返回 (是否额度耗尽, 说明)；说明用于日志（如 keyword:insufficient quota）。
+    非额度类失败（限流/鉴权/5xx）只记 provider_events，不改额度状态 —— 交给熔断处理。
+    """
+    cls = classify_error(http_status, body, cfg)
+    if cls.get("kind") == EXHAUSTED:
+        record_error(conn, provider, cls, cfg)
+        return True, cls.get("detail", "")
+    return False, cls.get("detail", "")

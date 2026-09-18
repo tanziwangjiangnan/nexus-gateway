@@ -1,6 +1,24 @@
 """HTTP API 层 — FastAPI 应用构建器。
-v3.2: 从 gateway.py 拆分。build_app(cfg, deps) 返回 FastAPI 实例，
-所有共享状态通过 deps 注入，避免循环依赖。
+
+职责边界（见 docs/模块约定.md）：本文件只做「装配 + 转发」——
+鉴权、请求解析、调用 provider_router 的决策函数、构造响应；
+额度 / 降级 / 选路 / 评分等业务判断都在 provider_router 对应模块里。
+
+一次 POST /v1/chat/completions 的处理顺序：
+  1. 鉴权（gateway_key）+ 请求解析（model / messages / stream / 用户自带 key）
+  2. 判定是否「显式指定模型」（auto、*、gateway-auto、default-auto 视为未指定 → 维护通道）
+  3. 前置检查层（仅未显式指定时）：复杂度规则 + token 置信度（1s，失败忽略）
+     → select_path() 给出路由规则（routing_rules）
+  4. 定位资源池，优先级：模型名精确匹配 > 路由规则 > 关键词路由 > 默认 pool_a
+  5. 故障转移链：池内按「额度 → 能力标签 → 权重」选 provider → 调用；
+     失败按 pool.fallback 链降级（pool_a → pool_b → pool_c），决策在 provider_router/fallback.py
+
+build_app(cfg, deps) 返回 FastAPI 实例；共享状态与外部能力全部经 deps 注入，
+既避免与 gateway.py 循环依赖，也让测试可以替换 DB / 选路实现。
+
+v3.2: 从 gateway.py 拆分。
+v3.12: 降级决策抽到 provider_router/fallback.py。
+v3.13: 额度包装下沉到 provider_router/quota.py（本文件只留连接与日志）。
 """
 
 # 保持与原 gateway.py 相同的模块级导入，确保依赖可用
@@ -350,12 +368,14 @@ def build_app(cfg, deps):
 
     # ── 额度过滤辅助（计划书 v1）：普通请求 / 角色路径 / 聚合共用 ──
     def _apply_quota_filter(providers, budget):
-        """复活冷却到期额度 → 过滤候选。异常时原样返回（不阻断路由）。"""
+        """额度过滤（含冷却复活）—— 逻辑在 provider_router/quota.py。
+
+        [2026-09-18] 模块约定第 1 步拆分：DB 与过滤逻辑下沉到模块，
+        本函数只做「开连接 → 调用 → 打日志」；异常时不阻断路由（原样返回候选）。
+        """
         try:
             with db_conn() as conn:
-                _quota_recover_due(conn)
-                statuses = _quota_get_statuses(conn, [p["name"] for p in providers])
-            allowed, blocked = _quota_filter(providers, statuses, budget, cfg)
+                allowed, blocked = _quota_mod.prepare_candidates(conn, providers, budget, cfg)
             if blocked:
                 print("🚫 额度过滤: " + ", ".join(f"{n}({r})" for n, r in blocked))
             return allowed
@@ -364,20 +384,19 @@ def build_app(cfg, deps):
             return providers
 
     def _quota_write_error(provider, http_status, body):
-        """分类并落库；返回是否额度耗尽。"""
+        """额度耗尽时落库并返回 True —— 分类与写入都在 provider_router/quota.py。
+
+        [2026-09-18] 同上：只保留连接与日志；任何异常按「非额度」处理，避免误伤路由。
+        """
         try:
-            cls = _quota_classify(http_status, body, cfg)
+            with db_conn() as conn:
+                exhausted, detail = _quota_mod.record_error_if_exhausted(
+                    conn, provider, http_status, body, cfg)
+            if exhausted:
+                print(f"💰 额度耗尽: {provider} ({detail})")
+            return exhausted
         except Exception:
             return False
-        if cls.get("kind") == "exhausted":
-            try:
-                with db_conn() as conn:
-                    _quota_record_error(conn, provider, cls, cfg)
-            except Exception:
-                pass
-            print(f"💰 额度耗尽: {provider} ({cls.get('detail')})")
-            return True
-        return False
 
     # ── 鉴权中间件 ──
     @app.middleware("http")
@@ -1281,6 +1300,15 @@ def build_app(cfg, deps):
         return Response(content=generate_latest(REGISTRY).decode(), media_type="text/plain")
 
     # ── Admin API ──
+    # ══════════════════════════════
+    # Admin 端点（排障 / 运维用，全部要求 gateway_key）
+    #   /admin/pools   池与 provider 状态、启停
+    #   /admin/quota   额度状态与人工标记（可 undo）
+    #   /admin/fiber*  任务树（创建 / 失败级联 / 提交 / 查看）
+    #   /admin/undo*   运行时逆栈
+    #   /admin/mcp*    工具审批缓存
+    #   /admin/logs    聚合各智能体日志
+    # ══════════════════════════════
     @app.get("/admin/pools")
     async def admin_pools():
         result = {}
@@ -2023,6 +2051,7 @@ def build_app(cfg, deps):
         }
 
     # ── 统一插件调用 /v1/plugins/{id}/call ──
+    # ── 插件调用端点：能力校验 → 重复调用拦截 → 成功即登记逆操作 ──
     @app.post("/v1/plugins/{plugin_id}/call")
     async def v1_plugins_call(plugin_id: str, request: Request):
         """统一插件调用入口。所有智能体通过此端点调用插件。
