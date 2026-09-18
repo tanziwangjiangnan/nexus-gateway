@@ -35,8 +35,14 @@ def collect_all_keys(config):
     return keys
 
 
-def scan_local(index, config, base):
-    """扫描本地依赖：.env, 已知 Agent 配置文件, 环境变量。"""
+def scan_local(index, config, base, home=None):
+    """扫描本地依赖：.env, 已知 Agent 配置文件, 环境变量。
+
+    base: 项目/工作目录（.env 所在处）。
+    home: 用户 HOME 基准，默认取真实 `~`。测试传 tmp_path 即可隔离，
+          避免误扫真实 HOME 下的 agent 配置。
+    """
+    home = home or os.path.expanduser("~")
     env_path = os.path.join(base, ".env")
     if os.path.isfile(env_path):
         with open(env_path) as f:
@@ -58,10 +64,10 @@ def scan_local(index, config, base):
                         })
 
     oh_paths = [
-        os.path.expanduser("~/.openhands/config.toml"),
-        os.path.expanduser("~/.config/oh/config.toml"),
-        os.path.expanduser("~/.hermes/config.yaml"),
-        os.path.expanduser("~/.hermes/.env"),
+        os.path.join(home, ".openhands/config.toml"),
+        os.path.join(home, ".config/oh/config.toml"),
+        os.path.join(home, ".hermes/config.yaml"),
+        os.path.join(home, ".hermes/.env"),
     ]
     for oh_path in oh_paths:
         if os.path.isfile(oh_path):
@@ -129,14 +135,14 @@ def scan_remote(host, port, cmd, config, label):
                  "fixable": False, "fix_type": "unreachable"}]
 
 
-def find_references(keys, base, include_remote=True):
+def find_references(keys, base, include_remote=True, home=None):
     """扫描指定配置值的下游引用。
 
     keys: {key_name: key_value} — 只扫描这些值的引用（通常是即将被替换的旧值）。
     返回 [{component, file, key_name, current_value, found_at, fixable, fix_type}]
     """
     index = []
-    scan_local(index, keys, base)
+    scan_local(index, keys, base, home=home)
     if include_remote:
         index += scan_remote("106.14.40.189", "2222",
                              "cat /opt/qq-bot/bot/astrbot/data/cmd_config.json",

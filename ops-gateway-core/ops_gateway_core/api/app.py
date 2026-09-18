@@ -21,7 +21,7 @@ import httpx
 
 from provider_router import Router
 from provider_router import select_provider_auto
-from ..cfg import get_db, db_conn
+from ..cfg import get_db, db_conn as _default_db_conn
 from ..fiber import FiberRuntime
 
 # ── 额度感知与任务保护（计划书 v1）──
@@ -46,10 +46,12 @@ except ImportError:
     REGISTRY = None
 
 
-def _get_provider_from_last_usage():
-    """返回最近一次调用使用的 provider 名（用于检查者评分关联）。"""
-    with db_conn() as conn:
-        row = conn.execute("SELECT provider FROM usage ORDER BY id DESC LIMIT 1").fetchone()
+def _get_provider_from_last_usage(conn):
+    """返回最近一次调用使用的 provider 名（用于检查者评分关联）。
+
+    conn 由调用方注入（与 app 内其余 db 访问走同一条连接来源）。
+    """
+    row = conn.execute("SELECT provider FROM usage ORDER BY id DESC LIMIT 1").fetchone()
     return row["provider"] if row else None
 
 
@@ -313,6 +315,9 @@ def build_app(cfg, deps):
     _serial_locks = deps["serial_locks"]
     _throttle_windows = deps["throttle_windows"]
     get_db = deps["get_db"]
+    # db_conn 同样走注入：生产用模块级全局路径，测试可指向临时库。
+    # 否则 app 内 with db_conn() 会写生产库，与注入的 get_db 分叉。
+    db_conn = deps.get("db_conn") or _default_db_conn
     _execute_plugin = deps["execute_plugin"]
     _format_string = deps["format_string"]
     _global_call_lookup = deps["global_call_lookup"]
@@ -1371,10 +1376,10 @@ def build_app(cfg, deps):
         if feedback not in (1, -1):
             raise HTTPException(status_code=400, detail="feedback must be 1 or -1")
         # 找到与 fiber 关联的 provider 最近一条 usage
-        provider = _get_provider_from_last_usage()
-        if not provider:
-            raise HTTPException(status_code=404, detail="no usage record found")
         with db_conn() as conn:
+            provider = _get_provider_from_last_usage(conn)
+            if not provider:
+                raise HTTPException(status_code=404, detail="no usage record found")
             conn.execute(
                 "UPDATE usage SET user_feedback = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY called_at DESC LIMIT 1)",
                 (feedback, provider))
@@ -1481,9 +1486,9 @@ def build_app(cfg, deps):
         if score is not None:
             f = _fiber_runtime.fiber_get(fiber_id)
             if f and f.parent_id is not None:
-                provider = _get_provider_from_last_usage()
-                if provider:
-                    with db_conn() as conn:
+                with db_conn() as conn:
+                    provider = _get_provider_from_last_usage(conn)
+                    if provider:
                         conn.execute(
                             "UPDATE usage SET checker_score = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY called_at DESC LIMIT 1)",
                             (score, provider))

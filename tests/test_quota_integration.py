@@ -52,11 +52,14 @@ def make_cfg(db_path):
 
 
 def make_deps(db_path):
-    import sqlite3
+    from ops_gateway_core.cfg.db import db_conn as _real_db_conn, get_db as _real_get_db
 
     def _get_db():
-        from ops_gateway_core.cfg.db import get_db
-        return get_db(db_path)
+        return _real_get_db(db_path)
+
+    def _db_conn():
+        # app 内 with db_conn() 必须落在临时库，否则测试数据写进生产库
+        return _real_db_conn(db_path)
 
     return {
         "disabled_providers": set(),
@@ -71,6 +74,7 @@ def make_deps(db_path):
         "serial_locks": {},
         "throttle_windows": {},
         "get_db": _get_db,
+        "db_conn": _db_conn,
         "execute_plugin": lambda *a, **k: (False, "no plugin"),
         "format_string": lambda t, p: t,
         "global_call_lookup": lambda p, h: None,

@@ -13,6 +13,22 @@ def reset_prometheus():
 
 
 # 构建最小依赖注入字典
+def _null_db_conn():
+    """内存库连接：本文件测 API 结构，不应触碰磁盘（尤其是生产库）。"""
+    from contextlib import contextmanager
+    import sqlite3
+
+    @contextmanager
+    def _cm():
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+    return _cm()
+
+
 def make_deps():
     return {
         "disabled_providers": set(),
@@ -25,6 +41,7 @@ def make_deps():
         "serial_locks": {},
         "throttle_windows": {},
         "get_db": lambda: None,
+        "db_conn": _null_db_conn,
         "execute_plugin": lambda *a, **k: (False, "no plugin"),
         "format_string": lambda template, params: template,
         "global_call_lookup": lambda p, h: None,

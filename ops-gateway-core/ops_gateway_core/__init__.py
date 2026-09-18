@@ -8,7 +8,7 @@ v3.9: 将 hermes_cfg / hermes_fiber / hermes_api / hermes_ops 四个内部包
 - ops-fiber-tree：Fiber 任务树存储
 """
 
-from .cfg import ConfigLoader, get_db, init_registry
+from .cfg import ConfigLoader, get_db, db_conn, init_registry
 from .fiber import FiberRuntime, Fiber
 from .api import build_app, _should_score, _score_by_runner_up
 from .ops import (
@@ -37,7 +37,7 @@ from .ops import (
 )
 
 __all__ = [
-    "ConfigLoader", "get_db", "init_registry",
+    "ConfigLoader", "get_db", "db_conn", "init_registry",
     "FiberRuntime", "Fiber",
     "build_app", "_should_score", "_score_by_runner_up",
     "probe_model", "probe_all", "call_provider_http",

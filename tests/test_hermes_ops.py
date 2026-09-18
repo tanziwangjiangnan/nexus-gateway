@@ -99,7 +99,7 @@ class TestCheckDeps:
                "providers": {"test-pv": {"api_key": "sk-test"}}}
         keys = collect_all_keys(cfg)
         index = []
-        scan_local(index, keys, str(tmp_path))
+        scan_local(index, keys, str(tmp_path), home=str(tmp_path))
         assert len(index) == 0  # 空目录无匹配
 
     def test_scan_local_finds_key(self, tmp_path):
@@ -109,7 +109,7 @@ class TestCheckDeps:
                "providers": {"test-pv": {"api_key": "sk-test"}}}
         keys = collect_all_keys(cfg)
         index = []
-        scan_local(index, keys, str(tmp_path))
+        scan_local(index, keys, str(tmp_path), home=str(tmp_path))
         assert len(index) == 1
         assert index[0]["current_value"] == "sk-test"
 
