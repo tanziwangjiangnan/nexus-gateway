@@ -178,7 +178,7 @@ def build_admin_router(*,
 
     # ── MCP 审批回调 ──
     # 让统筹 Agent 通过 HTTP 调用 toggle，走审批缓存 + fiber 树形上下文
-    _APPROVAL_TTL = 300  # 5 分钟
+    from ..constants import APPROVAL_TTL as _APPROVAL_TTL  # noqa: F401  (共享常量，见 constants.py)
 
     @router.get("/admin/mcp/approvals")
     async def admin_mcp_approvals():
