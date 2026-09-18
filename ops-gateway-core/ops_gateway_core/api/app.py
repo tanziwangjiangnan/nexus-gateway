@@ -46,6 +46,7 @@ from ..fiber import FiberRuntime
 # ── 额度感知与任务保护（计划书 v1）──
 # 纯逻辑在 provider_router.quota；此处只做别名，保持 app.py 内命名简短
 from provider_router import quota as _quota_mod
+from provider_router import select_runner_up
 from provider_router.scoring import (
     read_force_on as _read_force_on,
     should_score as _should_score,
@@ -980,10 +981,15 @@ def build_app(cfg, deps):
             else:
                 # 额度过滤（计划书 v1）：剔除 exhausted / low+large 预算
                 _budget = _quota_budget_level(kwargs.get("max_tokens"), cfg)
+                _cands = _apply_quota_filter(pool_cfg.get("providers", []), _budget)
                 pv, runner_up, _ = select_provider_with_runner_up(
-                    _apply_quota_filter(pool_cfg.get("providers", []), _budget),
-                    model=model_filter,
+                    _cands, model=model_filter,
                     query_caps=_query_caps, capability_threshold=_threshold)
+                if pv and not runner_up:
+                    # [2026-09-18] 池内各 provider 模型名互不相同 -> 带 model 过滤后只剩 1 个候选，
+                    # runner_up 会是 None，导致在线监督者评分永不触发。这里放宽为「同池其它可用 provider」。
+                    runner_up = select_runner_up(_cands, _router_state, pv["name"],
+                                                query_caps=_query_caps, capability_threshold=_threshold)
             if not pv:
                 last_error = f"pool '{current_pool}' all providers disabled"
                 if _advance_failure():

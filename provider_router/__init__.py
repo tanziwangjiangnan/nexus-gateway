@@ -4,7 +4,8 @@
 所有可变状态通过 RouterState 注入，由调用方维护。
 """
 
-from .router import Router, RouterState, call_model_router, select_provider_by_strategy, select_provider_auto
+from .router import (Router, RouterState, call_model_router, select_provider_by_strategy,
+                     select_provider_auto, select_runner_up)
 from .monitor import CircuitBreakerMonitor
 from .config import load_config
 from .cache import RouteCache, get_cache, set_cache_ttl
@@ -12,5 +13,6 @@ from .fallback import FallbackPlan, plan_pool_fallback, pool_model
 
 __all__ = ["Router", "RouterState", "CircuitBreakerMonitor", "load_config",
            "call_model_router", "select_provider_by_strategy", "select_provider_auto",
+           "select_runner_up",
            "RouteCache", "get_cache", "set_cache_ttl",
            "FallbackPlan", "plan_pool_fallback", "pool_model"]

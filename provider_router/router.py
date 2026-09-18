@@ -374,3 +374,22 @@ def select_provider_by_strategy(providers: list, state: RouterState, cfg: dict,
                                   capability_threshold=capability_threshold)
 
 
+def select_runner_up(providers: list, state, chosen_name: str,
+                     query_caps: dict = None, capability_threshold: float = None):
+    """给「检查者」（第二名）挑一个 provider：同池其它可用 provider，**允许换模型**。
+
+    [2026-09-18] 起因：各 provider 的模型名互不相同，带 model 的请求经模型过滤后
+    池内只剩 1 个候选 → select_provider_with_runner_up 的 runner_up 恒为 None，
+    于是在线监督者评分长期休眠（实测：强制 cold_start 也不会触发）。
+    检查者只需要「能读懂问题并复核答案」，不必与主 provider 同模型。
+
+    Returns:
+        provider dict 或 None（池内没有其它可用 provider）。
+    """
+    rest = [p for p in (providers or []) if p.get("name") != chosen_name]
+    if not rest:
+        return None
+    pv, ru, _ = Router.select_provider_with_runner_up(
+        rest, state, model=None, query_caps=query_caps,
+        capability_threshold=capability_threshold)
+    return pv or ru
