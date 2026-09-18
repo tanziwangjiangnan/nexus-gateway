@@ -12,6 +12,24 @@ import time
 from typing import Any, Callable, Optional
 
 
+def _model_ok(provider_entry, model_lower, state):
+    """该 provider 中是否有匹配 model_lower 且未被模型级熔断的模型。"""
+    name = provider_entry.get("name")
+    for m in provider_entry.get("models", []):
+        if m.lower() == model_lower and ("%s::%s" % (name, m)) not in state.disabled_providers:
+            return True
+    return False
+
+
+def _has_any_model(provider_entry, state):
+    """该 provider 是否至少还有一个未被模型级熔断的模型（无 models 字段则视为可用）。"""
+    name = provider_entry.get("name")
+    models = provider_entry.get("models", [])
+    if not models:
+        return True
+    return any(("%s::%s" % (name, m)) not in state.disabled_providers for m in models)
+
+
 @dataclasses.dataclass
 class RouterState:
     """路由引擎的可变状态容器，由调用方创建并维护生命周期。"""
@@ -77,11 +95,11 @@ class Router:
         若候选不足 2 个，runner_up 为 None。
         query_caps — 能力需求向量，不为 None 时启用能力标签过滤+匹配因子。
         """
-        candidates = [p for p in providers if p["name"] not in state.disabled_providers]
+        candidates = [p for p in providers
+                      if p["name"] not in state.disabled_providers and _has_any_model(p, state)]
         if model:
             model_lower = model.lower()
-            candidates = [p for p in candidates
-                          if model_lower in [m.lower() for m in p.get("models", [])]]
+            candidates = [p for p in candidates if _model_ok(p, model_lower, state)]
         # 能力标签过滤：query_caps 不为 None 时执行
         if query_caps is not None:
             from provider_router.assessor import filter_providers_by_capability
@@ -140,11 +158,11 @@ class Router:
 
         新增 query_caps / capability_threshold — 能力标签过滤，参见 select_provider_with_runner_up。
         """
-        candidates = [p for p in providers if p["name"] not in state.disabled_providers]
+        candidates = [p for p in providers
+                      if p["name"] not in state.disabled_providers and _has_any_model(p, state)]
         if model:
             model_lower = model.lower()
-            candidates = [p for p in candidates
-                          if model_lower in [m.lower() for m in p.get("models", [])]]
+            candidates = [p for p in candidates if _model_ok(p, model_lower, state)]
         # 能力标签过滤
         if query_caps is not None:
             from provider_router.assessor import filter_providers_by_capability
@@ -268,6 +286,43 @@ def call_model_router(query: str, candidates: list, config: dict,
             get_cache().set(query, selected)
         return selected
     return None
+
+
+def select_provider_auto(providers: list, state: RouterState, cfg: dict):
+    """自动优先级路由（routing_strategy.mode=auto）。
+
+    按 routing_strategy.auto.priority_models 从高到低找第一个「有可用 provider」的档位；
+    同档多个 provider 按权重并排选择。不调用任何模型，纯本地规则。
+
+    priority_models 项为模型名（大小写不敏感，跨池匹配），或 "*" 表示任意可用。
+
+    返回 (provider, runner_up, all_weights)，全空时 (None, None, {})。
+    """
+    auto_cfg = (cfg.get("routing_strategy", {}) or {}).get("auto", {}) or {}
+    tiers = auto_cfg.get("priority_models") or []
+
+    # 可用性初筛：排除已禁用（熔断）
+    available = [p for p in providers
+                 if p["name"] not in state.disabled_providers and _has_any_model(p, state)]
+    if not available:
+        return None, None, {}
+
+    for tier in tiers:
+        if tier == "*":
+            # 只剩至少一个未被模型级熔断的模型，才算候选
+            candidates = [p for p in available if _has_any_model(p, state)]
+        else:
+            t_lower = str(tier).lower()
+            candidates = [p for p in available if _model_ok(p, t_lower, state)]
+        if candidates:
+            picked, runner_up, weights = Router.select_provider_with_runner_up(candidates, state)
+            if picked:
+                return picked, runner_up, weights
+
+    # priority_models 为空时，退化为在全部可用里按权重选
+    if not tiers:
+        return Router.select_provider_with_runner_up(available, state)
+    return None, None, {}
 
 
 def select_provider_by_strategy(providers: list, state: RouterState, cfg: dict,

@@ -140,7 +140,7 @@ async def token_confidence(text: str, api: str, api_key: str, model: str,
 
 # ── 路径选择 ──
 
-def select_path(pre_check: dict, routing_rules: dict) -> dict:
+def select_path(pre_check: dict, routing_rules: dict, text: str = None) -> dict:
     """根据前置检查结果 + 规则表 选择执行路径。
 
     routing_rules 示例:
@@ -149,7 +149,7 @@ def select_path(pre_check: dict, routing_rules: dict) -> dict:
         simple_low_confidence:  { pool: "pool_b", validation: "light" }
         medium:     { pool: "pool_b", supervisor: true }
         complex:    { pool: "pool_c", supervisor: true }
-        very_complex: { pool: "fiber_split", segments: "auto" }
+        very_complex: { condition: "can_decompose(task)", path: "role_based", fallback: "agent_based" }
     """
     level = pre_check.get("complexity", {}).get("level", "medium")
     confidence = pre_check.get("confidence", {}).get("confidence", "unknown")
@@ -162,6 +162,14 @@ def select_path(pre_check: dict, routing_rules: dict) -> dict:
     if not rule:
         # 兜底：中等复杂度走池B
         rule = {"pool": "pool_b", "supervisor": True}
+
+    # very_complex 走 can_decompose 两条路径
+    if level == "very_complex" and text:
+        _can = can_decompose(text)
+        if _can.get("can"):
+            return dict(rule, **{"pool": "fiber_split", "path": "role_based", "decompose_reason": _can.get("reason")})
+        else:
+            return dict(rule, **{"pool": "fiber_split", "path": "agent_based", "decompose_reason": _can.get("reason")})
 
     return rule
 
@@ -187,6 +195,103 @@ def _detect_task_type(text: str) -> str:
     if not scores:
         return "general"
     return max(scores, key=scores.get)
+
+
+# ── 复杂层两条路径：can_decompose 判断（纯规则+关键词，0 模型调用） ──
+
+# 判断维度：structure/dependencies/capabilities/failure_mode
+# 查询中出现以下关键词时倾向于"可拆解"（角色路径）：
+_CAN_DECOMPOSE_KEYWORDS = {
+    "explicit_subgoals": [
+        "先", "再", "最后", "然后", "首先", "其次", "分别",
+        "分三步", "分两步", "分几步", "分阶段",
+        "第一步", "第二步", "第三步",
+        "先..再", "先..后",
+    ],
+    "dependency_chain": [
+        "再", "然后", "接着", "之后", "下一步",
+        "根据.*结果", "基于.*分析", "结合.*结论",
+    ],
+    "explicit_capabilities": [
+        "分析", "总结", "报告", "翻译", "解释", "实现", "设计",
+        "写", "编写", "生成", "整理", "排查", "修复",
+        "比较", "对比", "评估", "审查",
+    ],
+    "independent_retry": [
+        "分别", "各", "每个", "逐一", "并行",
+    ],
+}
+
+
+def can_decompose(text: str) -> dict:
+    """判断路由层能否提前拆解任务。
+
+    返回:
+        {
+            "can": bool,       # True = 能拆解 → 角色路径
+            "reason": str,     # 判断理由
+            "details": {...}   # 各维度命中详情
+        }
+    """
+    if not text:
+        return {"can": False, "reason": "empty_text", "details": {}}
+
+    q = text.lower()
+
+    # 维度1：是否有明确子目标
+    has_subgoals = False
+    sg_matches = []
+    for kw in _CAN_DECOMPOSE_KEYWORDS["explicit_subgoals"]:
+        if kw in q:
+            has_subgoals = True
+            sg_matches.append(kw)
+
+    # 维度2：是否有清晰依赖关系
+    has_deps = False
+    dep_matches = []
+    for kw in _CAN_DECOMPOSE_KEYWORDS["dependency_chain"]:
+        if kw in q:
+            has_deps = True
+            dep_matches.append(kw)
+
+    # 维度3：是否有多个能力需求（≥2 个不同能力关键词）
+    cap_matches = []
+    for kw in _CAN_DECOMPOSE_KEYWORDS["explicit_capabilities"]:
+        if kw in q:
+            cap_matches.append(kw)
+    has_explicit_caps = len(set(cap_matches)) >= 2
+
+    # 维度4：子任务是否可独立重试
+    has_retry = False
+    retry_matches = []
+    for kw in _CAN_DECOMPOSE_KEYWORDS["independent_retry"]:
+        if kw in q:
+            has_retry = True
+            retry_matches.append(kw)
+
+    # 综合判断：至少满足维度1+维度3，或维度1+维度2，或三个维度全满足
+    can = (has_subgoals and has_explicit_caps) or (has_subgoals and has_deps)
+
+    reasons = []
+    if has_subgoals:
+        reasons.append(f"明确子目标({','.join(sg_matches[:3])})")
+    if has_deps:
+        reasons.append(f"依赖关系({','.join(dep_matches[:3])})")
+    if has_explicit_caps:
+        reasons.append(f"多能力需求({','.join(set(cap_matches))})")
+    if has_retry:
+        reasons.append("可独立重试")
+
+    return {
+        "can": can,
+        "reason": "; ".join(reasons) if reasons else ("无需拆解" if not can else ""),
+        "details": {
+            "has_explicit_subgoals": has_subgoals,
+            "has_dependency_chain": has_deps,
+            "has_explicit_capability_needs": has_explicit_caps,
+            "has_independent_retry": has_retry,
+        },
+    }
 
 
 def _build_section_index(text: str, paragraphs: list) -> list:

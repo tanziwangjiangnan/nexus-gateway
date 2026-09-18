@@ -31,6 +31,7 @@ def load_config(path: str, providers_override: dict = None) -> dict:
     mode = raw.get("mode", "formula")
     model_router = raw.get("model_router", {})
     formula = raw.get("formula", {})
+    auto = raw.get("auto", {}) or {}
     cfg["routing_strategy"] = {
         "mode": mode,
         "model_router": {
@@ -41,5 +42,7 @@ def load_config(path: str, providers_override: dict = None) -> dict:
             "cache_ttl_seconds": model_router.get("cache_ttl_seconds", 300),
         },
         "formula": formula,
+        # auto 模式：按优先级档位自动选（不手动指定模型）
+        "auto": {"priority_models": auto.get("priority_models", [])},
     }
     return cfg

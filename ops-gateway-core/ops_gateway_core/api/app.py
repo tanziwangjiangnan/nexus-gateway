@@ -20,8 +20,19 @@ import yaml
 import httpx
 
 from provider_router import Router
-from ..cfg import get_db
+from provider_router import select_provider_auto
+from ..cfg import get_db, db_conn
 from ..fiber import FiberRuntime
+
+# ── 额度感知与任务保护（计划书 v1）──
+# 纯逻辑在 provider_router.quota；此处只做别名，保持 app.py 内命名简短
+from provider_router import quota as _quota_mod
+_quota_classify = _quota_mod.classify_error
+_quota_budget_level = _quota_mod.budget_level
+_quota_get_statuses = _quota_mod.get_statuses
+_quota_filter = _quota_mod.filter_candidates
+_quota_record_error = _quota_mod.record_error
+_quota_recover_due = _quota_mod.recover_due
 
 # prometheus 客户端（延迟导入，兼容无 prometheus 环境）
 try:
@@ -37,9 +48,8 @@ except ImportError:
 
 def _get_provider_from_last_usage():
     """返回最近一次调用使用的 provider 名（用于检查者评分关联）。"""
-    conn = get_db()
-    row = conn.execute("SELECT provider FROM usage ORDER BY id DESC LIMIT 1").fetchone()
-    conn.close()
+    with db_conn() as conn:
+        row = conn.execute("SELECT provider FROM usage ORDER BY id DESC LIMIT 1").fetchone()
     return row["provider"] if row else None
 
 
@@ -229,20 +239,18 @@ async def _score_by_runner_up(cfg, provider, runner_up,
             if score is None:
                 return
             # 写入 DB
-            conn = get_db()
-            conn.execute(
-                "UPDATE usage SET checker_score = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY id DESC LIMIT 1)",
-                (score, provider))
-            conn.commit()
-            conn.close()
+            with db_conn() as conn:
+                conn.execute(
+                    "UPDATE usage SET checker_score = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY id DESC LIMIT 1)",
+                    (score, provider))
+                conn.commit()
             # 更新运行时质量因子
             quality_window = cfg.get("quality_feedback", {}).get("quality_window", 20)
-            conn2 = get_db()
-            rows = conn2.execute(
-                "SELECT checker_score FROM usage WHERE provider = ? AND checker_score IS NOT NULL ORDER BY id DESC LIMIT ?",
-                (provider, quality_window)
-            ).fetchall()
-            conn2.close()
+            with db_conn() as conn2:
+                rows = conn2.execute(
+                    "SELECT checker_score FROM usage WHERE provider = ? AND checker_score IS NOT NULL ORDER BY id DESC LIMIT ?",
+                    (provider, quality_window)
+                ).fetchall()
             if rows:
                 avg = sum(r[0] for r in rows) / len(rows)
                 quality_factors[provider] = max(0.5, min(1.0, avg / 100.0))
@@ -331,6 +339,37 @@ def build_app(cfg, deps):
     from fastapi.responses import JSONResponse, StreamingResponse, Response
 
     app = FastAPI(title="模型池网关 v2", version="0.2.0")
+
+    # ── 额度过滤辅助（计划书 v1）：普通请求 / 角色路径 / 聚合共用 ──
+    def _apply_quota_filter(providers, budget):
+        """复活冷却到期额度 → 过滤候选。异常时原样返回（不阻断路由）。"""
+        try:
+            with db_conn() as conn:
+                _quota_recover_due(conn)
+                statuses = _quota_get_statuses(conn, [p["name"] for p in providers])
+            allowed, blocked = _quota_filter(providers, statuses, budget, cfg)
+            if blocked:
+                print("🚫 额度过滤: " + ", ".join(f"{n}({r})" for n, r in blocked))
+            return allowed
+        except Exception as e:
+            print(f"⚠️  额度过滤异常（忽略）: {e}")
+            return providers
+
+    def _quota_write_error(provider, http_status, body):
+        """分类并落库；返回是否额度耗尽。"""
+        try:
+            cls = _quota_classify(http_status, body, cfg)
+        except Exception:
+            return False
+        if cls.get("kind") == "exhausted":
+            try:
+                with db_conn() as conn:
+                    _quota_record_error(conn, provider, cls, cfg)
+            except Exception:
+                pass
+            print(f"💰 额度耗尽: {provider} ({cls.get('detail')})")
+            return True
+        return False
 
     # ── 鉴权中间件 ──
     @app.middleware("http")
@@ -494,24 +533,22 @@ def build_app(cfg, deps):
     # ── 模型列表 ──
     @app.get("/v1/models")
     async def list_models():
-        conn = get_db()
-        rows = conn.execute("""SELECT r.model, r.pool, r.provider, r.tier, r.status,
-                                      COALESCE(SUM(u.prompt_tokens+u.completion_tokens), 0) as tokens
-                               FROM registry r LEFT JOIN usage u ON u.model=r.model
-                               GROUP BY r.model ORDER BY r.pool, r.model""").fetchall()
-        conn.close()
+        with db_conn() as conn:
+            rows = conn.execute("""SELECT r.model, r.pool, r.provider, r.tier, r.status,
+                                          COALESCE(SUM(u.prompt_tokens+u.completion_tokens), 0) as tokens
+                                   FROM registry r LEFT JOIN usage u ON u.model=r.model
+                                   GROUP BY r.model ORDER BY r.pool, r.model""").fetchall()
 
         # 计算每个 provider 最近 5 分钟的错误率
-        conn2 = get_db()
-        err_rows = conn2.execute("""
-            SELECT provider,
-                   COUNT(*) as total,
-                   SUM(ok) as success
-            FROM usage
-            WHERE called_at > datetime('now', '-5 minutes')
-            GROUP BY provider
-        """).fetchall()
-        conn2.close()
+        with db_conn() as conn2:
+            err_rows = conn2.execute("""
+                SELECT provider,
+                       COUNT(*) as total,
+                       SUM(ok) as success
+                FROM usage
+                WHERE called_at > datetime('now', '-5 minutes')
+                GROUP BY provider
+            """).fetchall()
         provider_errors = {}
         for r in err_rows:
             total = r["total"]
@@ -560,6 +597,19 @@ def build_app(cfg, deps):
                 entry["capabilities"] = caps
             data.append(entry)
 
+        # [2026-09-14] 补一个合成的 auto 条目（维护通道）：
+        # 客户端若用 /v1/models 校验模型清单，没有它就会拒绝 model=auto。
+        data.insert(0, {
+            "id": "auto",
+            "object": "model",
+            "pool": "auto",
+            "provider": "auto",
+            "tier": "-",
+            "status": "active",
+            "error_rate": None,
+            "today_tokens": 0,
+            "description": "维护通道：按稳定优先序自动选择模型（不指定模型即走这里）",
+        })
         return {"object": "list", "data": data}
 
     # ── 聊天补全（三池路由核心） ──
@@ -567,12 +617,19 @@ def build_app(cfg, deps):
     async def chat_completions(request: Request):
         t0 = time.time()
         body = await request.json()
-        model = body.get("model", "DeepSeek-V4-Flash")
+        # [2026-09-14] 维护通道哨兵：model ∈ {auto, *, gateway-auto, default-auto}
+        # 视为「未显式指定模型」→ 走 auto（维护通道）。
+        # 原因：Codex / DSH / Claude Code 等 OpenAI 兼容客户端**必须**带 model 字段，
+        # 否则无法请求维护通道；而「完全不传 model」只有手写 curl 才做得到。
+        _AUTO_SENTINELS = ("auto", "*", "gateway-auto", "default-auto")
+        _model_raw = body.get("model", "")
+        _is_auto_sentinel = str(_model_raw or "").strip().lower() in _AUTO_SENTINELS
+        model = "DeepSeek-V4-Flash" if (not _model_raw or _is_auto_sentinel) else _model_raw
         messages = body.get("messages", [])
         stream = body.get("stream", False)
         # 用户自定义 key（从聊天页面带入），覆盖 provider 配置的 key
         user_key = body.pop("api_key", None)
-        explicit_model = "model" in body  # 用户是否显式指定模型（前置检查仅拦截未指定的）
+        explicit_model = ("model" in body) and not _is_auto_sentinel
         kwargs = {k: v for k, v in body.items() if k not in ("model", "messages", "stream")}
 
         # 1. 模型名精确匹配（大小写不敏感，优先级最高）
@@ -621,9 +678,9 @@ def build_app(cfg, deps):
                                     timeout=1.2)
                         except Exception:
                             pass  # Token 概率检测失败不影响主流程和路径选择
-                    # 路径选择（纯本地规则，<5ms）
+                    # 路径选择（纯本地规则，<5ms）— 新增 probe_text 传参支持 complex 层两条路径
                     _routing_rules = cfg.get("routing_rules", {})
-                    _rule = select_path(_pre_check, _routing_rules)
+                    _rule = select_path(_pre_check, _routing_rules, text=probe_text)
                     _pre_check["rule"] = _rule
                     print(f"🔍 前置检查: level={_pre_check.get('complexity',{}).get('level')}, "
                           f"confidence={_pre_check.get('confidence',{}).get('confidence')}, "
@@ -647,7 +704,9 @@ def build_app(cfg, deps):
         _path_rule = _pre_check.get("rule") if _pre_check else None
         if _path_rule and pool_name and not explicit_model and not user_key:
             _rule_pool = _path_rule.get("pool")
-            if _path_rule.get("action") == "direct_return":
+            # [2026-09-14] 维护通道（model=auto）不做 trivial 短路：
+            # agent 排障时发来的短请求也应真正调用模型，而不是收到固定话术。
+            if _path_rule.get("action") == "direct_return" and not _is_auto_sentinel:
                 _msg = _path_rule.get("message") or "您好，请问有什么可以帮您？"
                 app.state.req_counter.labels(pool="direct", provider="none", status="200").inc()
                 return Response(
@@ -679,6 +738,170 @@ def build_app(cfg, deps):
                                 model = _pv["models"][0]
                                 break
 
+        # 3c. 复杂层两条路径：fiber_split（角色路径 / 智能体路径）
+        #     very_complex 且 can_decompose → role_based；否则 → agent_based
+        #     路径标记先初始化，供下方故障转移链写 usage 使用
+        _used_path = "agent_based" if (_pre_check.get("rule", {}).get("path") == "agent_based") else "normal"
+        _agent_id = None
+        if (_path_rule and _path_rule.get("pool") == "fiber_split"
+                and not explicit_model and not user_key):
+            _sub_path = _path_rule.get("path", "agent_based")
+            if _sub_path == "role_based":
+                # ── 角色路径：拆解 → 分配角色 → 每角色独立选模型 → 执行 → 聚合 ──
+                try:
+                    from provider_router.multipath import (
+                        decompose_task, build_subtask_messages, build_aggregate_messages,
+                        role_capability_vector)
+                    _subtasks = decompose_task(probe_text)
+                    if _subtasks:
+                        print(f"🔀 角色路径: 拆解为 {len(_subtasks)} 个子任务")
+                        _parent_fid = fiber_create("complex_role", probe_text[:80])
+
+                        # 汇总全部 provider（跨池）供角色选模型
+                        _all_providers = []
+                        for _pn, _pc in cfg.get("pools", {}).items():
+                            # [2026-09-13] 跳过标记为 auto_routable=false 的池（如 pool_test），
+                            # 使其只可按模型名显式调用，不进入自动路由候选
+                            if _pc.get("auto_routable", True) is False:
+                                continue
+                            _all_providers.extend(_pc.get("providers", []))
+
+                        _results = []
+                        _agg_model_used = model
+                        for _st in _subtasks:
+                            _st_fid = fiber_create(f"role_{_st['role']}", _st['task'][:60], parent_id=_parent_fid)
+                            _sub_msgs = build_subtask_messages(_st, messages)
+                            # 角色 → 能力向量 → 能力标签匹配选模型
+                            _cap_vec = role_capability_vector(_st.get("role"), cfg)
+                            # model=None：跨池按能力选，不受用户 model 限制
+                            # 额度过滤：角色子任务按 normal 预算（计划书 v1：每步前选可用模型）
+                            _pv, _, _ = select_provider_with_runner_up(
+                                _apply_quota_filter(_all_providers, _quota_budget_level(kwargs.get("max_tokens"), cfg)),
+                                model=None,
+                                query_caps=_cap_vec,
+                                capability_threshold=0.2,
+                            )
+                            if not _pv:
+                                _results.append(f"[{_st['role']}] 无可用 provider")
+                                fiber_fail(_st_fid)
+                                continue
+                            _st_pcfg = cfg.get("providers", {}).get(_pv["name"], {})
+                            _st_key = Router.resolve_env_key(_st_pcfg.get("api_key", ""))
+                            if not _st_key:
+                                _results.append(f"[{_st['role']}] key 未配置")
+                                fiber_fail(_st_fid)
+                                continue
+                            _st_api = _st_pcfg.get("api", "").rstrip("/")
+                            _st_model = _pv.get("models", [model])[0]
+                            try:
+                                async with httpx.AsyncClient(timeout=120) as _st_client:
+                                    _st_resp = await _st_client.post(
+                                        f"{_st_api}/chat/completions",
+                                        json={"model": _st_model, "messages": _sub_msgs, "max_tokens": 2000},
+                                        headers={"Authorization": f"Bearer {_st_key}"},
+                                    )
+                                    _st_data = _st_resp.json()
+                                    _st_content = ""
+                                    for _ch in _st_data.get("choices", []):
+                                        _m = _ch.get("message", {})
+                                        if isinstance(_m, dict):
+                                            _st_content += _m.get("content", "") or ""
+                                    _results.append(_st_content)
+                                    # 额度感知（计划书 v1）：子任务失败时也做分类落库
+                                    if _st_resp.status_code != 200:
+                                        _quota_write_error(_pv["name"], _st_resp.status_code, _st_resp.text)
+                                    try:
+                                        with db_conn() as _conn:
+                                            _conn.execute(
+                                                "INSERT INTO usage (model, pool, provider, path_type, role, ok) "
+                                                "VALUES (?,?,?,?,?,?)",
+                                                (_st_model, "fiber_split", _pv["name"], "role_based", _st["role"],
+                                                 1 if _st_resp.status_code == 200 else 0))
+                                            _conn.commit()
+                                    except Exception:
+                                        pass
+                                    fiber_commit(_st_fid)
+                            except Exception as _st_e:
+                                _results.append(f"[{_st['role']}] 执行失败: {str(_st_e)[:80]}")
+                                fiber_fail(_st_fid)
+
+                        # 聚合：调一次汇总模型整合各子任务结果
+                        _agg_content = None
+                        _agg_pv, _, _ = select_provider_with_runner_up(
+                            _apply_quota_filter(
+                                _all_providers,
+                                _quota_budget_level(kwargs.get("max_tokens"), cfg)))
+                        if _agg_pv:
+                            _agg_pcfg = cfg.get("providers", {}).get(_agg_pv["name"], {})
+                            _agg_key = Router.resolve_env_key(_agg_pcfg.get("api_key", ""))
+                            _agg_api = _agg_pcfg.get("api", "").rstrip("/")
+                            _agg_model = _agg_pv.get("models", [model])[0]
+                            _agg_msgs = build_aggregate_messages(_subtasks, _results, messages)
+                            try:
+                                async with httpx.AsyncClient(timeout=120) as _agg_client:
+                                    _agg_resp = await _agg_client.post(
+                                        f"{_agg_api}/chat/completions",
+                                        json={"model": _agg_model, "messages": _agg_msgs, "max_tokens": 2000},
+                                        headers={"Authorization": f"Bearer {_agg_key}"},
+                                    )
+                                    _agg_data = _agg_resp.json()
+                                    _agg_content = ""
+                                    for _ch in _agg_data.get("choices", []):
+                                        _m = _ch.get("message", {})
+                                        if isinstance(_m, dict):
+                                            _agg_content += _m.get("content", "") or ""
+                                    if _agg_content:
+                                        _agg_model_used = _agg_model
+                            except Exception:
+                                _agg_content = None
+
+                        fiber_commit(_parent_fid)
+
+                        if _agg_content:
+                            return Response(
+                                content=json.dumps({
+                                    "id": f"chatcmpl-rolepath-{int(t0*1000)}",
+                                    "object": "chat.completion",
+                                    "created": int(t0),
+                                    "model": _agg_model_used,
+                                    "choices": [{
+                                        "index": 0,
+                                        "message": {"role": "assistant", "content": _agg_content},
+                                        "finish_reason": "stop",
+                                    }],
+                                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                                }),
+                                status_code=200, media_type="application/json")
+
+                        # 聚合失败兜底：拼接各子任务结果
+                        _fallback_content = "\n\n".join(
+                            f"【{st.get('role')}】{st.get('task')}\n{r}"
+                            for st, r in zip(_subtasks, _results))
+                        return Response(
+                            content=json.dumps({
+                                "id": f"chatcmpl-rolepath-{int(t0*1000)}",
+                                "object": "chat.completion",
+                                "created": int(t0),
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": _fallback_content},
+                                    "finish_reason": "stop",
+                                }],
+                                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                            }),
+                            status_code=200, media_type="application/json")
+                except Exception as _role_e:
+                    print(f"⚠️ 角色路径异常，降级智能体路径: {_role_e}")
+                    # 降级：继续走智能体路径
+
+            # ── 智能体路径：选一个智能体（= 选一个 provider），自行处理 ──
+            # 取消 fiber_split 的 pool 控制，让下方故障转移链正常选 provider
+            print(f"🔀 智能体路径: 交给单一智能体处理")
+            _path_rule = None  # 释放路径控制，走常规路由
+            _agent_id = "agent_single"
+            # 由故障转移链记录 usage（path_type=agent_based 在写库处附加）
+
         # 4. 走故障转移链
         tried_pools = set()
         current_pool = pool_name
@@ -706,10 +929,49 @@ def build_app(cfg, deps):
             # 4. 按路由策略选 provider（v2.8 模型路由）
             #    formula: 现有权重轮询（同时选出第二名作为潜在检查者）
             #    model/hybrid: 先调用外部路由模型服务，失败时按配置降级
+            #    auto: 按优先级档位跨池自动选（不手动指定模型）
             # 用户自定义 key 时不限制模型名（用户用自己的 key 调任何 provider），
             # 否则只选有该模型的 provider
             model_filter = None if user_key else model
             strategy_mode = (cfg.get("routing_strategy") or {}).get("mode", "formula")
+
+            # ── auto 模式：跨池按优先级档位自动选（仅当用户未显式指定模型）──
+            if (strategy_mode == "auto" and select_provider_auto
+                    and not explicit_model and not user_key):
+                _all_pv = []
+                for _pc in cfg.get("pools", {}).values():
+                    # [2026-09-13] 同上：跳过 auto_routable=false 的池
+                    if _pc.get("auto_routable", True) is False:
+                        continue
+                    _all_pv.extend(_pc.get("providers", []))
+                _budget_a = _quota_budget_level(kwargs.get("max_tokens"), cfg)
+                _auto_pool_list = _apply_quota_filter(_all_pv, _budget_a)
+                _auto_pv, _auto_ru, _ = select_provider_auto(_auto_pool_list, _router_state, cfg)
+                if _auto_pv:
+                    # [2026-09-14 修复] 反查池必须**同时匹配 provider 名字和这次要用的模型**。
+                    # 同一 provider 名会出现在多个池里（deepseek-direct 在 pool_a/b/c 都有，
+                    # 但各池挂的模型不同）。只按名字找第一个池，会把
+                    # pool_c/deepseek-direct(deepseek-chat) 错认成 pool_a/deepseek-direct(deepseek-flash)，
+                    # 随后用 model=deepseek-chat 在该池过滤 -> 无候选 -> 误报 all pools exhausted。
+                    _ms = _auto_pv.get("models") or [model]
+                    _ok_ms = [m for m in _ms
+                              if ("%s::%s" % (_auto_pv["name"], m)) not in _disabled_providers]
+                    model = (_ok_ms or _ms)[0]
+                    _auto_pool = None
+                    for _pn, _pcfg in cfg.get("pools", {}).items():
+                        if any(x["name"] == _auto_pv["name"] and model in x.get("models", [])
+                               for x in _pcfg.get("providers", [])):
+                            _auto_pool = _pn
+                            break
+                    if _auto_pool:
+                        print(f"🤖 auto 路由 → {_auto_pv['name']} @ {_auto_pool} (model={model})", flush=True)
+                        current_pool = _auto_pool
+                        tried_pools.add(_auto_pool)
+                        pool_cfg = cfg["pools"][_auto_pool]
+                        model_filter = model
+                else:
+                    print(f"🤖 auto 无可用档位（候选={[p['name'] for p in _auto_pool_list]}）", flush=True)
+
             strategy_pv = None
             if select_provider_by_strategy and strategy_mode in ("model", "hybrid") and messages_text:
                 strategy_pv = select_provider_by_strategy(
@@ -726,8 +988,11 @@ def build_app(cfg, deps):
             if strategy_pv:
                 pv, runner_up = strategy_pv, None
             else:
+                # 额度过滤（计划书 v1）：剔除 exhausted / low+large 预算
+                _budget = _quota_budget_level(kwargs.get("max_tokens"), cfg)
                 pv, runner_up, _ = select_provider_with_runner_up(
-                    pool_cfg.get("providers", []), model=model_filter,
+                    _apply_quota_filter(pool_cfg.get("providers", []), _budget),
+                    model=model_filter,
                     query_caps=_query_caps, capability_threshold=_threshold)
             if not pv:
                 last_error = f"pool '{current_pool}' all providers disabled"
@@ -777,16 +1042,25 @@ def build_app(cfg, deps):
                     # 记录用量
                     try:
                         data = resp.json()
-                        conn = get_db()
-                        conn.execute("INSERT INTO usage (model, pool, provider, prompt_tokens, completion_tokens, ok) VALUES (?,?,?,?,?,?)",
-                                     (model, current_pool, pv["name"],
-                                      data.get("usage", {}).get("prompt_tokens", 0),
-                                      data.get("usage", {}).get("completion_tokens", 0),
-                                      1 if status_code == 200 else 0))
-                        conn.commit()
-                        conn.close()
+                        with db_conn() as conn:
+                            conn.execute(
+                                "INSERT INTO usage (model, pool, provider, prompt_tokens, completion_tokens, ok, path_type, agent_id) "
+                                "VALUES (?,?,?,?,?,?,?,?)",
+                                (model, current_pool, pv["name"],
+                                 data.get("usage", {}).get("prompt_tokens", 0),
+                                 data.get("usage", {}).get("completion_tokens", 0),
+                                 1 if status_code == 200 else 0,
+                                 _used_path, _agent_id))
+                            conn.commit()
                     except Exception:
                         pass
+
+                    # 额度分类（计划书 v1）：402 / 429 / 关键词 → 写状态并当场尝试下一个候选
+                    if _quota_write_error(pv["name"], status_code, resp_body):
+                        last_error = f"quota exhausted: {pv['name']}"
+                        app.state.req_counter.labels(pool=current_pool, provider=pv["name"], status="quota").inc()
+                        current_pool = pool_cfg.get("fallback")
+                        continue
 
                     # 失败但不 fallback 的情况（HTTP 4xx 是客户端问题）
                     if status_code in (400, 401, 403, 404, 422):
@@ -918,13 +1192,12 @@ def build_app(cfg, deps):
                 pc = cfg.get("providers", {}).get(pv["name"], {})
                 # 从 registry 表读取真实健康状态（由熔断器主动探测更新）
                 try:
-                    conn = get_db()
-                    row = conn.execute(
-                        "SELECT status FROM registry WHERE provider = ? ORDER BY updated_at DESC LIMIT 1",
-                        (pv["name"],)
-                    ).fetchone()
-                    reg_status = row[0] if row else "unknown"
-                    conn.close()
+                    with db_conn() as conn:
+                        row = conn.execute(
+                            "SELECT status FROM registry WHERE provider = ? ORDER BY updated_at DESC LIMIT 1",
+                            (pv["name"],)
+                        ).fetchone()
+                        reg_status = row[0] if row else "unknown"
                 except Exception:
                     reg_status = "unknown"
                 providers.append({
@@ -976,6 +1249,63 @@ def build_app(cfg, deps):
     async def admin_undo_list():
         return {"stack": _fiber_runtime.undo_list()}
 
+    # ── 额度状态 Admin API（计划书 v1）──
+    @app.get("/admin/quota")
+    async def admin_quota():
+        """查看所有 provider 的额度状态。"""
+        conn = get_db()
+        try:
+            summary = _quota_mod.provider_status_summary(conn, cfg)
+            events = [dict(r) for r in conn.execute(
+                "SELECT id, provider, event_type, status, http_status, detail, created_at "
+                "FROM provider_events ORDER BY id DESC LIMIT 50").fetchall()]
+        finally:
+            conn.close()
+        return {"summary": summary, "recent_events": events}
+
+    @app.post("/admin/quota/{provider_name}/set")
+    async def admin_quota_set(provider_name: str, request: Request):
+        """人工标记额度状态：{"status": "available|low|exhausted|unknown", "reason": "..."}。
+
+        注册逆操作，可通过 /admin/undo 撤销（恢复原状态）。
+        """
+        body = await request.json()
+        new_status = body.get("status")
+        valid = {"unknown", "available", "low", "exhausted", "unavailable"}
+        if new_status not in valid:
+            raise HTTPException(status_code=400, detail=f"invalid status, one of {sorted(valid)}")
+        # 验证 provider 存在
+        found = any(pv["name"] == provider_name
+                    for pc in cfg.get("pools", {}).values()
+                    for pv in pc.get("providers", []))
+        if not found:
+            raise HTTPException(status_code=404, detail=f"provider '{provider_name}' not found")
+
+        conn = get_db()
+        try:
+            prev = _quota_mod.get_status(conn, provider_name)
+        finally:
+            conn.close()
+
+        def _revert(name=provider_name, prev=prev):
+            c = get_db()
+            try:
+                _quota_mod.set_status(c, name, prev.get("status", "unknown"),
+                                      f"undo: {prev.get('reason','')}", "manual")
+            finally:
+                c.close()
+
+        conn = get_db()
+        try:
+            _quota_mod.set_status(conn, provider_name, new_status,
+                                  body.get("reason", "manual"), "manual")
+        finally:
+            conn.close()
+        undo_register(f"额度状态 {provider_name} → {prev.get('status')}",
+                      _revert)
+        return {"provider": provider_name, "status": new_status,
+                "previous": prev.get("status")}
+
     # ── MCP 审批回调 ──
     # 让统筹 Agent 通过 HTTP 调用 toggle，走审批缓存 + fiber 树形上下文
     _APPROVAL_TTL = 300  # 5 分钟
@@ -995,13 +1325,12 @@ def build_app(cfg, deps):
     async def admin_mcp_status():
         """MCP 状态总览：熔断 + 权重 + 审批"""
         # 5 分钟滑动窗口错误率
-        conn = get_db()
-        rows = conn.execute("""
-            SELECT provider, COUNT(*) as total, SUM(ok) as success
-            FROM usage WHERE called_at > datetime('now', '-5 minutes')
-            GROUP BY provider
-        """).fetchall()
-        conn.close()
+        with db_conn() as conn:
+            rows = conn.execute("""
+                SELECT provider, COUNT(*) as total, SUM(ok) as success
+                FROM usage WHERE called_at > datetime('now', '-5 minutes')
+                GROUP BY provider
+            """).fetchall()
         providers_status = []
         for r in rows:
             total = r["total"]
@@ -1045,20 +1374,18 @@ def build_app(cfg, deps):
         provider = _get_provider_from_last_usage()
         if not provider:
             raise HTTPException(status_code=404, detail="no usage record found")
-        conn = get_db()
-        conn.execute(
-            "UPDATE usage SET user_feedback = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY called_at DESC LIMIT 1)",
-            (feedback, provider))
-        conn.commit()
-        conn.close()
+        with db_conn() as conn:
+            conn.execute(
+                "UPDATE usage SET user_feedback = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY called_at DESC LIMIT 1)",
+                (feedback, provider))
+            conn.commit()
         # 实时更新用户因子（不等30秒循环）
         qf_cfg = cfg.get("quality_feedback", {}).get("user_window", 20)
-        conn2 = get_db()
-        urows = conn2.execute(
-            "SELECT user_feedback FROM usage WHERE provider = ? AND user_feedback != 0 ORDER BY called_at DESC LIMIT ?",
-            (provider, qf_cfg)
-        ).fetchall()
-        conn2.close()
+        with db_conn() as conn2:
+            urows = conn2.execute(
+                "SELECT user_feedback FROM usage WHERE provider = ? AND user_feedback != 0 ORDER BY called_at DESC LIMIT ?",
+                (provider, qf_cfg)
+            ).fetchall()
         total = sum(r[0] for r in urows)
         _user_factors[provider] = max(0.5, min(1.5, 1.0 + total * 0.1))
         return {"status": "ok", "provider": provider, "user_factor": _user_factors[provider]}
@@ -1156,12 +1483,11 @@ def build_app(cfg, deps):
             if f and f.parent_id is not None:
                 provider = _get_provider_from_last_usage()
                 if provider:
-                    conn = get_db()
-                    conn.execute(
-                        "UPDATE usage SET checker_score = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY called_at DESC LIMIT 1)",
-                        (score, provider))
-                    conn.commit()
-                    conn.close()
+                    with db_conn() as conn:
+                        conn.execute(
+                            "UPDATE usage SET checker_score = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY called_at DESC LIMIT 1)",
+                            (score, provider))
+                        conn.commit()
         return {"fiber_id": fiber_id, "status": "committed"}
 
     @app.get("/admin/fiber/tree")

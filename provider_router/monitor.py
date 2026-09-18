@@ -85,14 +85,31 @@ class CircuitBreakerMonitor:
     def _scan(self):
         cfg = self.cfg_getter()
         conn = self.get_db()
-        rows = conn.execute("""
-            SELECT provider,
-                   COUNT(*) as total,
-                   SUM(ok) as success
-            FROM usage
-            WHERE called_at > datetime('now', '-5 minutes')
-            GROUP BY provider
-        """).fetchall()
+        # [2026-09-14 修复] 排除测试池（auto_routable=false）里的模型：
+        # 它们本来就不可用，其调用失败不该计入共享 provider 的错误率，
+        # 否则一个注定失败的模型就能把整个 provider 熔断（已造成过 8.5 小时故障）。
+        test_models = []
+        for _pc in cfg.get("pools", {}).values():
+            if _pc.get("auto_routable", True) is False:
+                for _pv in _pc.get("providers", []):
+                    test_models.extend(_pv.get("models", []))
+        if test_models:
+            _qmarks = ",".join("?" * len(test_models))
+            rows = conn.execute(
+                f"""SELECT provider, model, COUNT(*) as total, SUM(ok) as success
+                FROM usage
+                WHERE called_at > datetime('now', '-5 minutes')
+                  AND model NOT IN ({_qmarks})
+                GROUP BY provider, model""",
+                tuple(test_models)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT provider, model,
+                       COUNT(*) as total,
+                       SUM(ok) as success
+                FROM usage
+                WHERE called_at > datetime('now', '-5 minutes')
+                GROUP BY provider, model""").fetchall()
 
         # 质量信誉因子（检查者评分驱动）
         quality_cfg = cfg.get("quality_feedback", {})
@@ -127,31 +144,42 @@ class CircuitBreakerMonitor:
                 self.user_factors[provider] = self.user_factor_fn(feedbacks)
 
         # ── 熔断/恢复/动态权重：基于 5 分钟滑动窗口错误率 ──
+        # [2026-09-14] 粒度改为**模型级**：熔断键 "provider::model"。
+        # 原来按 provider 统计，单个模型的故障会把整个 provider（及其它健康模型）一起禁用。
+        # 现在只禁故障模型本身；provider 级禁用仅由「主动探测」路径负责（端点不可达才是 provider 的问题）。
+        prov_agg = {}
         for r in rows:
             name = r["provider"]
+            model = r["model"]
             total = r["total"]
+            a = prov_agg.setdefault(name, [0, 0])
+            a[0] += total
+            a[1] += (r["success"] or 0)
             if total < 5:
                 continue
             success = r["success"] or 0
             err_rate = 1.0 - (success / total)
-            is_disabled = name in self.disabled_providers
+            key = "%s::%s" % (name, model)
+            is_disabled = key in self.disabled_providers
 
-            # 熔断：错误率超过阈值 -> 自动禁用
+            # 熔断：该模型错误率超阈值 -> 只禁这个模型
             if err_rate > self.error_threshold and not is_disabled:
                 with self.lock:
-                    self.disabled_providers.add(name)
+                    self.disabled_providers.add(key)
                 if self.undo_register:
-                    self.undo_register(f"自动熔断禁用 {name} (err={err_rate:.0%})",
-                                       lambda n=name: self.disabled_providers.discard(n))
-                print(f"熔断: {name} 错误率 {err_rate:.0%} -> 已禁用")
+                    self.undo_register(f"模型熔断 {key} (err={err_rate:.0%})",
+                                       lambda k=key: self.disabled_providers.discard(k))
+                print(f"熔断(模型级): {key} 错误率 {err_rate:.0%} -> 已禁用该模型")
 
-            # 恢复：错误率低于恢复阈值且是被熔断禁用的 -> 自动恢复
+            # 恢复：该模型错误率回到阈值以下 -> 解除
             elif err_rate < self.recover_threshold and is_disabled:
                 with self.lock:
-                    self.disabled_providers.discard(name)
-                print(f"恢复: {name} 错误率 {err_rate:.0%} -> 已启用")
+                    self.disabled_providers.discard(key)
+                print(f"恢复(模型级): {key} 错误率 {err_rate:.0%} -> 已启用")
 
-            # 动态权重：base_weight * (1 - err_rate)，保底 0.1
+        # 动态权重仍按 provider 聚合（影响 provider 之间的权重分配）
+        for name, (total, success) in prov_agg.items():
+            err_rate = 1.0 - (success / total) if total else 0.0
             base = 1.0
             for pc in cfg.get("pools", {}).values():
                 for pv in pc.get("providers", []):
@@ -163,11 +191,22 @@ class CircuitBreakerMonitor:
         # ── 主动探测：usage 无流量的 provider 做一次 HTTP 连通性探测 ──
         # 打通 probe/registry/熔断三孤岛：探测失败 -> 熔断禁用 + registry=down
         active = {r["provider"] for r in rows}
+        handled_providers = set()   # [2026-09-14] 每个 provider 每轮只探一次
         for pc in cfg.get("pools", {}).values():
+            # [2026-09-14 修复] 跳过测试池（auto_routable=false）：
+            # 主动探测取的是 provider 在该池里的 models[0]，而测试池里放的都是
+            # 注定不可用的模型（图像模型/已废弃模型名），用它们探测会把
+            # 共享同一 provider 的生产模型一起熔断 —— 这是 09-13 夜 8.5 小时故障的直接原因。
+            if pc.get("auto_routable", True) is False:
+                continue
             for pv in pc.get("providers", []):
                 name = pv["name"]
-                if name in active:
+                if name in active or name in handled_providers:
+                    # [2026-09-14] 同一 provider 出现在多个池时只探第一次（最早=主池里的模型），
+                    # 否则 pool_b 里 qfg-new 的 models[0]=gpt-5.4（间歇失败）会把整个 provider
+                    # 判死，而下一个池又探成功再启用，写成 enable/disable 来回翻转。
                     continue
+                handled_providers.add(name)
                 pc_raw = cfg.get("providers", {}).get(name, {})
                 api = pc_raw.get("api", "")
                 key = pc_raw.get("api_key", "")

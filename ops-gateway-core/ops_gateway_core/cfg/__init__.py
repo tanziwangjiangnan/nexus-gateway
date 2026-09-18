@@ -5,7 +5,7 @@
 """
 
 from .loader import ConfigLoader
-from .db import get_db
+from .db import get_db, db_conn
 from .registry import init_registry
 
-__all__ = ["ConfigLoader", "get_db", "init_registry"]
+__all__ = ["ConfigLoader", "get_db", "db_conn", "init_registry"]

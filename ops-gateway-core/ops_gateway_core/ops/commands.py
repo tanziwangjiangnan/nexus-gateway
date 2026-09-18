@@ -16,15 +16,17 @@ from ..cfg import get_db
 
 def cmd_models(cfg):
     conn = get_db(cfg.get("config", {}).get("db_path"))
-    rows = conn.execute("""SELECT r.model, r.pool, r.provider, r.tier, r.status,
+    rows = conn.execute("""SELECT r.model, r.pool, r.provider,\n                                  COALESCE(NULLIF(r.providers,''), r.provider) AS providers,\n                                  r.tier, r.status,
                                   COALESCE(SUM(u.prompt_tokens+u.completion_tokens), 0) as tokens
                            FROM registry r LEFT JOIN usage u ON u.model=r.model
                            GROUP BY r.model ORDER BY r.pool, r.model""").fetchall()
     conn.close()
-    print(f"{'模型名':<28s} {'池':<8s} {'Provider':<14s} {'档位':<4s} {'状态':<10s} {'今日用量'}")
+    print(f"{'模型名':<28s} {'池':<10s} {'来源(provider)':<30s} {'档位':<4s} {'状态':<9s} {'今日用量'}")
     print("─" * 85)
     for r in rows:
-        print(f"{r['model']:<28s} {r['pool']:<8s} {r['provider']:<14s} {r['tier']:<4s} {r['status']:<10s} {r['tokens']:>8d} tokens")
+        src = r['providers']
+        mark = '  ← 多来源' if ',' in src else ''
+        print(f"{r['model']:<28s} {r['pool']:<10s} {src:<30s} {r['tier']:<4s} {r['status']:<9s} {r['tokens']:>8d} tokens{mark}")
     print(f"\n共 {len(rows)} 个模型")
 
 

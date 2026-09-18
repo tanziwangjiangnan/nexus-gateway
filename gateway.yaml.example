@@ -56,3 +56,31 @@ routing_rules:
   very_complex:
     pool: pool_c
     supervisor: true
+
+# ── 自动优先级路由（mode: auto）──
+# 不手动指定模型：按 priority_models 从高到低找第一个可用档位，同档多 provider 并排（权重）。
+# routing_strategy:
+#   mode: auto
+#   auto:
+#     priority_models: ["deepseek-v4-flash", "deepseek-flash", "deepseek-v4-pro", "*"]
+
+# ── 额度感知与任务保护（计划书 v1）──
+# 区分「服务不可达」与「额度耗尽」；请求前及多步任务每步前剔除已耗尽 provider。
+quota_guard:
+  enabled: true
+  cooldown_seconds: 600          # exhausted 后冷却，到期自动复活为 unknown 重新探测
+  budget_thresholds:             # max_tokens 分档：small/normal/large
+    small: 512
+    large: 4096
+  exhausted_keywords:            # 命中即判额度耗尽（大小写不敏感）
+    - insufficient balance
+    - insufficient_quota
+    - quota exceeded
+    - 余额不足
+    - 额度不足
+  # balance_api:                  # 可选：provider 官方余额查询适配器（默认无）
+  #   <provider>: "https://.../balance"
+
+# 管理接口：
+#   GET  /admin/quota                        查看额度状态 + 最近事件
+#   POST /admin/quota/{provider}/set         人工标记（{"status": "exhausted"}），可 undo
