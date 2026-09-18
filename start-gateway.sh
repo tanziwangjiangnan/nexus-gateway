@@ -11,5 +11,7 @@ set -a
 set +a
 
 PY=/root/.cache/uv/archive-v0/WdYmsw0dGK6sV6qi/bin/python3
-nohup "$PY" gateway.py >> gateway.log 2>&1 &
-echo "已启动，PID $!"
+# setsid 让网关脱离当前终端/tmux 会话，否则会话结束时网关会被一起回收。
+setsid nohup "$PY" gateway.py >> gateway.log 2>&1 < /dev/null &
+sleep 5
+echo "已启动，PID $(cat gateway.pid 2>/dev/null || echo '?')（父进程应为 1）"
