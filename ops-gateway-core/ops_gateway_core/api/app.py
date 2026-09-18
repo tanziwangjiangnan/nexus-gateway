@@ -21,6 +21,7 @@ import httpx
 
 from provider_router import Router
 from provider_router import select_provider_auto
+from provider_router.fallback import plan_pool_fallback
 from ..cfg import get_db, db_conn as _default_db_conn
 from ..fiber import FiberRuntime
 
@@ -241,14 +242,16 @@ async def _score_by_runner_up(cfg, provider, runner_up,
             if score is None:
                 return
             # 写入 DB
-            with db_conn() as conn:
+            # [2026-09-18] 本函数在 build_app 之外，看不到 deps 注入的 db_conn，
+            # 只能用模块级别名（762e7da 把 import 改成别名后这里漏改，评分一直 NameError）。
+            with _default_db_conn() as conn:
                 conn.execute(
                     "UPDATE usage SET checker_score = ? WHERE id = (SELECT id FROM usage WHERE provider = ? ORDER BY id DESC LIMIT 1)",
                     (score, provider))
                 conn.commit()
             # 更新运行时质量因子
             quality_window = cfg.get("quality_feedback", {}).get("quality_window", 20)
-            with db_conn() as conn2:
+            with _default_db_conn() as conn2:
                 rows = conn2.execute(
                     "SELECT checker_score FROM usage WHERE provider = ? AND checker_score IS NOT NULL ORDER BY id DESC LIMIT ?",
                     (provider, quality_window)
@@ -913,6 +916,71 @@ def build_app(cfg, deps):
         last_error = "no available provider"
         used_provider = ""
 
+        # [2026-09-18] auto 维护通道：某档的 provider 失败后，**排除它再按优先序选下一档**。
+        # 背景：原来失败只会看 `pool_cfg.fallback`，而 pool_fallback 没有 fallback，
+        # 于是一个额度耗尽/鉴权失败的兜底档会挡住后面的 '*' 档（实测 auto 直接 403/503）。
+        _auto_failed = set()
+
+        def _auto_advance():
+            """auto 模式专用换档。成功则更新 current_pool/model/model_filter 并返回 True。"""
+            nonlocal current_pool, model, model_filter, pool_cfg
+            if not (_is_auto_sentinel and not user_key and strategy_mode == "auto"):
+                return False
+            if not used_provider or used_provider in _auto_failed:
+                return False
+            _auto_failed.add(used_provider)
+            _list = []
+            for _pc in cfg.get("pools", {}).values():
+                if _pc.get("auto_routable", True) is False:
+                    continue
+                _list.extend(_pc.get("providers", []))
+            _list = [p for p in _apply_quota_filter(_list, _quota_budget_level(kwargs.get("max_tokens"), cfg))
+                     if p["name"] not in _auto_failed]
+            _pv2, _, _ = select_provider_auto(_list, _router_state, cfg)
+            if not _pv2:
+                return False
+            _pool2 = _m2 = None
+            for _pn, _pcfg in cfg.get("pools", {}).items():
+                for _x in _pcfg.get("providers", []):
+                    if _x["name"] != _pv2["name"]:
+                        continue
+                    for _mm in (_x.get("models") or []):
+                        if ("%s::%s" % (_pv2["name"], _mm)) not in _disabled_providers:
+                            _pool2, _m2 = _pn, _mm
+                            break
+                if _pool2:
+                    break
+            if not _pool2:
+                return False
+            print(f"↩️ auto 换档 → {_pv2['name']} @ {_pool2} (model={_m2})", flush=True)
+            current_pool, model, model_filter = _pool2, _m2, _m2
+            pool_cfg = cfg["pools"][_pool2]
+            tried_pools.discard(_pool2)
+            return True
+
+        def _advance_failure():
+            """失败/无候选后找下一个候选，成功返回 True。
+
+            ① auto 维护通道：排除失败 provider 后按优先序换档；
+            ② 其它情况：沿 pool.fallback 链降级（pool_a 到 pool_b 到 pool_c），
+               目标池没有该 model 时自动换成池内可用模型。
+
+            [2026-09-18] 决策逻辑抽到 `provider_router/fallback.py`（纯函数 + 单测），
+            这里只把决策应用到 current_pool / model / model_filter / pool_cfg。
+            """
+            nonlocal current_pool, model, model_filter, pool_cfg
+            if _auto_advance():
+                return True
+            plan = plan_pool_fallback(cfg, current_pool, model, tried_pools, _disabled_providers)
+            if not plan:
+                return False
+            if str(plan.model).lower() != str(model).lower():
+                print(f"↩️ 降级换模型: {model} → {plan.model} @ {plan.pool}", flush=True)
+                model, model_filter = plan.model, plan.model
+            current_pool = plan.pool
+            pool_cfg = cfg.get("pools", {}).get(plan.pool) or pool_cfg
+            return True
+
         # 能力标签匹配：提取一次，复用多池迭代
         _query_caps = None
         _threshold = None
@@ -1001,6 +1069,8 @@ def build_app(cfg, deps):
                     query_caps=_query_caps, capability_threshold=_threshold)
             if not pv:
                 last_error = f"pool '{current_pool}' all providers disabled"
+                if _advance_failure():
+                    continue
                 current_pool = pool_cfg.get("fallback")
                 continue
 
@@ -1010,6 +1080,8 @@ def build_app(cfg, deps):
             effective_key = user_key or configured_key
             if not provider_cfg or not effective_key:
                 last_error = f"provider '{pv['name']}' key not resolved"
+                if _advance_failure():
+                    continue
                 current_pool = pool_cfg.get("fallback")
                 continue
 
@@ -1064,11 +1136,24 @@ def build_app(cfg, deps):
                     if _quota_write_error(pv["name"], status_code, resp_body):
                         last_error = f"quota exhausted: {pv['name']}"
                         app.state.req_counter.labels(pool=current_pool, provider=pv["name"], status="quota").inc()
+                        if _advance_failure():
+                            continue
                         current_pool = pool_cfg.get("fallback")
                         continue
 
+                    # [2026-09-18] 401/403 属 provider 侧问题（key 失效 / 额度 / 权限），
+                    # 不是客户端错误：auto 维护通道继续换档；显式指定模型时仍原样透传（便于诊断）。
+                    if status_code in (401, 403):
+                        app.state.req_counter.labels(pool=current_pool, provider=pv["name"], status=str(status_code)).inc()
+                        _b = (resp_body or "")[:160].replace("\n", " ")
+                        print(f"🔑 上游 {status_code}: {pv['name']} model={model} → {_b}", flush=True)
+                        last_error = f"upstream {status_code} from {pv['name']}"
+                        if _advance_failure():
+                            continue
+                        return Response(content=resp_body, status_code=status_code, media_type="application/json")
+
                     # 失败但不 fallback 的情况（HTTP 4xx 是客户端问题）
-                    if status_code in (400, 401, 403, 404, 422):
+                    if status_code in (400, 404, 422):
                         app.state.req_counter.labels(pool=current_pool, provider=pv["name"], status=str(status_code)).inc()
                         app.state.req_duration.labels(provider=pv["name"]).observe(time.time() - t0)
                         return Response(content=resp_body, status_code=status_code, media_type="application/json")
@@ -1077,6 +1162,8 @@ def build_app(cfg, deps):
                     if status_code >= 500:
                         last_error = f"HTTP {status_code}"
                         print(f"🔴 上游 {status_code}: {pv['name']} model={model}")
+                        if _advance_failure():
+                            continue
                         current_pool = pool_cfg.get("fallback")
                         continue
 
@@ -1102,16 +1189,22 @@ def build_app(cfg, deps):
             except httpx.TimeoutException:
                 last_error = "timeout"
                 print(f"⏱️ 超时: {pv['name']} model={model} timeout=120s")
+                if _advance_failure():
+                    continue
                 current_pool = pool_cfg.get("fallback")
                 continue
             except httpx.ConnectError:
                 last_error = "unreachable"
                 print(f"🔌 不可达: {pv['name']} api={provider_cfg.get('api','?')}")
+                if _advance_failure():
+                    continue
                 current_pool = pool_cfg.get("fallback")
                 continue
             except Exception as e:
                 last_error = str(e)
                 print(f"⚠️ 请求异常: {pv['name']} model={model} error={e}")
+                if _advance_failure():
+                    continue
                 current_pool = pool_cfg.get("fallback")
                 continue
 

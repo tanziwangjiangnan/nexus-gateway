@@ -28,6 +28,9 @@ gateway.pid
 .DS_Store
 Thumbs.db
 
+# Backups created by ops (never commit)
+*.bak.*
+
 # Logs & temp
 logs/
 tmp/

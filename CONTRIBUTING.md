@@ -27,6 +27,11 @@ python3 -m pytest tests/ -v
    - 改动思路
    - 测试情况
 
+## 模块约定（必读）
+
+新代码放哪个模块、依赖方向、改动流程、`app.py` 拆分路线，见 **[`docs/模块约定.md`](docs/模块约定.md)**；
+在本仓库工作的智能体另见 [`AGENTS.md`](AGENTS.md)。
+
 ## 代码风格
 
 - Python 3.12+

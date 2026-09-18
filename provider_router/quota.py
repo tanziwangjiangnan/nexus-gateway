@@ -92,10 +92,22 @@ def classify_error(http_status: int, body: str, cfg: dict = None) -> dict:
 
 
 def _exhausted_keywords(cfg: dict) -> list:
+    """配置关键词 **合并** 内置默认词（配置不再整体覆盖默认）。
+
+    [2026-09-18] 起因：gateway.yaml 里只写了 "insufficient_quota"（下划线），
+    而 kouri 实际返回 "Insufficient quota."（空格）-> 未被识别为额度耗尽，
+    于是既没写 exhausted 状态、又按 403「鉴权错误」透传客户端。
+    """
     raw = ((cfg or {}).get("quota_guard", {}) or {}).get("exhausted_keywords")
-    if isinstance(raw, list) and raw:
-        return [str(k) for k in raw]
-    return DEFAULT_EXHAUSTED_KEYWORDS
+    out = [str(k) for k in DEFAULT_EXHAUSTED_KEYWORDS]
+    lower = [x.lower() for x in out]
+    if isinstance(raw, list):
+        for k in raw:
+            s = str(k)
+            if s and s.lower() not in lower:
+                out.append(s)
+                lower.append(s.lower())
+    return out
 
 
 def budget_level(max_tokens, cfg: dict = None) -> str:

@@ -8,7 +8,9 @@ from .router import Router, RouterState, call_model_router, select_provider_by_s
 from .monitor import CircuitBreakerMonitor
 from .config import load_config
 from .cache import RouteCache, get_cache, set_cache_ttl
+from .fallback import FallbackPlan, plan_pool_fallback, pool_model
 
 __all__ = ["Router", "RouterState", "CircuitBreakerMonitor", "load_config",
            "call_model_router", "select_provider_by_strategy", "select_provider_auto",
-           "RouteCache", "get_cache", "set_cache_ttl"]
+           "RouteCache", "get_cache", "set_cache_ttl",
+           "FallbackPlan", "plan_pool_fallback", "pool_model"]

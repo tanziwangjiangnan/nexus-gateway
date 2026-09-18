@@ -8,7 +8,10 @@ import sqlite3
 from contextlib import contextmanager
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH = os.path.join(_PROJECT_ROOT, "gateway.db")
+# [2026-09-18] 支持 GATEWAY_DB_PATH 覆盖：此前路径写死，导致「用 GATEWAY_DB_PATH 另起
+# 一个隔离实例做实验」时，registry/usage/provider_quota 仍然写进生产库
+# （2026-09-18 隔离实例把 kouri 误标 exhausted 到生产库，实测复现）。
+DB_PATH = os.environ.get("GATEWAY_DB_PATH") or os.path.join(_PROJECT_ROOT, "gateway.db")
 
 _SCHEMA = [
     """CREATE TABLE IF NOT EXISTS registry (
