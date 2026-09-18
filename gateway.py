@@ -65,7 +65,7 @@ import httpx
 # ── 组件包导入 ──
 from provider_router import Router, RouterState, CircuitBreakerMonitor, select_provider_by_strategy
 from fiber_tree import FiberTree, MemoryStorage
-from ops_gateway_core import ConfigLoader, get_db, init_registry
+from ops_gateway_core import ConfigLoader, get_db, db_conn, init_registry
 from ops_gateway_core.fiber import FiberRuntime
 from ops_gateway_core.ops.check_deps import check_deps_on_diff
 
@@ -346,6 +346,7 @@ def create_app(cfg):
         "serial_locks": _serial_locks,
         "throttle_windows": _throttle_windows,
         "get_db": get_db,
+        "db_conn": db_conn,
         "execute_plugin": _execute_plugin,
         "format_string": _format_string,
         "global_call_lookup": _global_call_lookup,
