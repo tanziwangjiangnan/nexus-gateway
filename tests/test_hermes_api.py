@@ -64,6 +64,23 @@ def make_deps():
     }
 
 
+
+
+def _all_route_paths(routes):
+    """递归收集路由路径：本版 FastAPI 的 include_router 会挂一个 _IncludedRouter
+    （不再把子路由摊平进 app.routes），所以这里要往下钻一层。"""
+    out = []
+    for r in routes:
+        p = getattr(r, "path", None)
+        if p:
+            out.append(p)
+        for attr in ("routes", "router", "original_router"):
+            sub = getattr(r, attr, None)
+            sub_routes = getattr(sub, "routes", None)
+            if sub_routes:
+                out.extend(_all_route_paths(sub_routes))
+    return out
+
 class TestBuildApp:
     def test_build_app_returns_app(self):
         cfg = {"gateway_key": "test", "port": 8646}
@@ -79,7 +96,7 @@ class TestBuildApp:
     def test_admin_routes(self):
         cfg = {"gateway_key": "test", "port": 8646}
         app = build_app(cfg, make_deps())
-        paths = [r.path for r in app.routes if hasattr(r, "path")]
+        paths = _all_route_paths(app.routes)
         assert "/admin/fiber/tree" in paths
         assert "/admin/undo-list" in paths
         assert "/v1/models" in paths
@@ -93,7 +110,7 @@ class TestBuildApp:
     def test_route_count_stable(self):
         cfg = {"gateway_key": "test", "port": 8646}
         app = build_app(cfg, make_deps())
-        paths = [r.path for r in app.routes if hasattr(r, "path")]
+        paths = _all_route_paths(app.routes)
         assert len(paths) >= 20
 
 class TestShouldScore:
