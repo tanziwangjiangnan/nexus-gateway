@@ -1,6 +1,10 @@
-"""对外元信息端点：/chat 页 + /v1/models 模型目录。
+"""对外元信息端点：/chat 聊天页 + /v1/models 模型目录。
 
-参数由 app.py 注入（见 docs/模块约定.md）。
+  GET /chat        自带的聊天页（免鉴权，页面内自带 key 输入），HTML 内联在本文件
+  GET /v1/models   模型目录：池/provider/健康/今日用量，另补一个**合成的 auto 条目**
+                   （维护通道哨兵；客户端用 /v1/models 校验模型清单时没有它会拒绝 model=auto）
+
+依赖：只读配置 + 注入的 db_conn，不做任何调度判断。
 """
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -16,6 +20,7 @@ def build_meta_router(*,
     router = APIRouter()
     @router.get("/chat")
     async def chat_page():
+        """返回自带聊天页（单页 HTML + 内嵌 CSS/JS，免鉴权）。"""
         """简洁的聊天入口，用户带自己的 key 走三池路由"""
         gw_key = cfg.get("gateway_key", "")
         # 收集可用模型
@@ -148,6 +153,10 @@ def build_meta_router(*,
     # ── 模型列表 ──
     @router.get("/v1/models")
     async def list_models():
+        """返回模型目录（含池 / provider / 健康 / 今日用量）+ 合成的 auto 条目。
+
+        读 registry 表（按模型聚合，同一模型多来源会拼成逗号列表）；不发任何外部请求。
+        """
         with db_conn() as conn:
             rows = conn.execute("""SELECT r.model, r.pool, r.provider, r.tier, r.status,
                                           COALESCE(SUM(u.prompt_tokens+u.completion_tokens), 0) as tokens

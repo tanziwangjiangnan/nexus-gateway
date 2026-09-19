@@ -1,6 +1,25 @@
 """chat 主链：/v1/chat/completions（三池路由 + 降级）与 /v1/direct/chat/completions。
 
-参数由 app.py 注入（见 docs/模块约定.md）。
+本文件只做**编排**，业务判断全在 provider_router：
+  选路 / 权重 / 能力过滤  provider_router/router.py
+  降级链决策            provider_router/fallback.py
+  额度过滤与分类        provider_router/quota.py
+  评分触发判定          provider_router/scoring.py
+  评分后台任务          ops_gateway_core/scoring_worker.py
+
+一次请求的处理顺序（handler 内用「步骤 N」标注）：
+  步骤 0  解析请求 + 判定是否显式指定模型（auto / * / gateway-auto / default-auto = 未指定 → 维护通道）
+  步骤 1  模型名精确匹配（显式指定时优先级最高，命中即定池、跳过前置检查）
+  步骤 2  关键词路由（模型未命中时）
+  步骤 3  兜底默认池 → 前置检查（复杂度 + token 置信度）→ 路径规则选池
+  步骤 3c 复杂层两条路径（角色路径 / 智能体路径，属 fiber_split）
+  步骤 4  故障转移链（池内选 provider → 调用 → 失败按 fallback 降级；每池只试一次）
+  步骤 5  限流检查（29 不降级）
+  步骤 6  发起调用 + 响应处理（4xx 透传 / 5xx·超时·不可达 降级）
+  步骤 7  成功返回 + 异步「监督者评分」（按采样触发）
+
+为什么参数这么多：本模块是从 api/app.py **原样搬出来**的，所有依赖靠工厂注入
+（不碰全局状态，便于单独测试），见 docs/模块约定.md 第 5 步。
 """
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
@@ -43,8 +62,14 @@ def build_chat_router(*,
 ):
     """参数由 app.py 注入（见 docs/模块约定.md）；路由内容与抽出前逐字一致。"""
     router = APIRouter()
+    # ── 步骤 0：解析请求 + 判定是否显式指定模型 ──
     @router.post("/v1/chat/completions")
     async def chat_completions(request: Request):
+        """POST /v1/chat/completions —— 主链：解析 → 路由 → 池内选 provider → 调用 → 降级 → 响应。
+
+        入参：OpenAI 兼容 chat 请求体；额外支持 `api_key`（用户自带 key，绕过池限制）与 model 哨兵（auto / * / gateway-auto / default-auto）。
+        边界：本函数只编排；不抛业务异常 —— 失败会沿 pool.fallback 链降级，全失败才 503。
+        """
         t0 = time.time()
         body = await request.json()
         # [2026-09-14] 维护通道哨兵：model ∈ {auto, *, gateway-auto, default-auto}
@@ -594,6 +619,7 @@ def build_chat_router(*,
                         current_pool = pool_cfg.get("fallback")
                         continue
 
+                    # ── 步骤 7：成功返回（记指标 + 按采样触发异步评分）──
                     app.state.req_counter.labels(pool=current_pool, provider=pv["name"], status="200").inc()
                     app.state.req_duration.labels(provider=pv["name"]).observe(time.time() - t0)
                     # 第二名检查者：自适应采样频率
@@ -637,6 +663,7 @@ def build_chat_router(*,
 
         app.state.req_counter.labels(pool=pool_name, provider=used_provider or "none", status="503").inc()
         app.state.req_duration.labels(provider=used_provider or "none").observe(time.time() - t0)
+        # 全部池都试过且都失败 → 503（这里的 last_error 是最后一次失败原因，方便排查）
         raise HTTPException(status_code=503, detail=f"all pools exhausted: {last_error}")
 
     # ── 直连端点：不走池路由、关键词匹配、故障转移 ──

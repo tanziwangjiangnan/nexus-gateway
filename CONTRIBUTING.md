@@ -6,7 +6,9 @@
 
 ```bash
 # 安装所有包（editable 模式）
-pip install -e ./provider_router -e ./fiber_tree -e ./hermes_fiber -e ./hermes_cfg -e ./hermes_ops -e ./hermes_api
+pip install -e ./provider_router -e ./fiber_tree -e ./ops-gateway-core
+# 仓库根下的 hermes_api / hermes_cfg / hermes_fiber / hermes_ops 是「已废弃的兼容壳」，
+# 只做 re-export，新代码不要用；确认无外部依赖后可整体删除。
 
 # 运行测试
 python3 -m pytest tests/ -v
